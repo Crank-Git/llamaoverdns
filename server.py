@@ -576,10 +576,17 @@ import argparse
 
 SYSTEM_PROMPT = "Answer in plain text, under 600 characters, no markdown, no preamble."
 
-USAGE_STRING = (
-    "ollama-over-dns: dig @127.0.0.1 -p 5353 +short <prompt>.e.com TXT; "
-    "labels before .e.com are the prompt; prefix p<N>. (e.g. p1.) to page."
-)
+# 5353 is mDNS (mDNSResponder / avahi hold it), so the default is a port with
+# no well-known service.
+DEFAULT_PORT = 5300
+
+
+def make_usage_string(zone="e.com", host="127.0.0.1", port=DEFAULT_PORT):
+    """The one-line help returned for TXT at the zone apex."""
+    at = "<server>" if host in ("", "0.0.0.0", "::") else host
+    port_opt = "" if port == 53 else f" -p {port}"
+    return (f"ollama-over-dns: dig @{at}{port_opt} +short <prompt>.{zone} TXT; "
+            f"labels before .{zone} are the prompt; prefix p<N>. (e.g. p1.) to page.")
 
 
 def max_page_bytes(limit=MAX_UDP):
@@ -604,7 +611,7 @@ class Server:
 
     def __init__(self, backend, *, zone="e.com", page_bytes=600, wait=3.5,
                  max_gen=2, cache_ttl=600, max_entries=64,
-                 system_prompt=SYSTEM_PROMPT, usage_string=USAGE_STRING):
+                 system_prompt=SYSTEM_PROMPT, usage_string=None):
         if not MIN_PAGE_BYTES <= page_bytes <= max_page_bytes():
             raise ValueError(f"page_bytes must be {MIN_PAGE_BYTES}..{max_page_bytes()} "
                              f"so every reply fits {MAX_UDP} bytes")
@@ -615,7 +622,7 @@ class Server:
         self.manager = GenerationManager(backend, cache_ttl=cache_ttl,
                                          max_entries=max_entries, max_gen=max_gen)
         self.system_prompt = system_prompt
-        self.usage_string = usage_string
+        self.usage_string = usage_string or make_usage_string(zone)
 
     def _txt_response(self, question, qid, opt, text, limit):
         rdata = build_txt_rdata(split_txt(text))
@@ -905,8 +912,10 @@ def make_backend(args):
 
 def main(argv=None):
     p = argparse.ArgumentParser(description="Answer TXT DNS queries with LLM output.")
-    p.add_argument("--host", default="0.0.0.0")
-    p.add_argument("--port", type=int, default=5353)
+    p.add_argument("--host", default="127.0.0.1",
+                   help="address to bind (default 127.0.0.1; 0.0.0.0 exposes the "
+                        "model to every host that can reach this one)")
+    p.add_argument("--port", type=int, default=DEFAULT_PORT)
     p.add_argument("--zone", default="e.com")
     p.add_argument("--backend", choices=["ollama", "llamacpp"], default="ollama")
     p.add_argument("--url", default=None)
@@ -922,7 +931,8 @@ def main(argv=None):
 
     backend = make_backend(args)
     server = Server(backend, zone=args.zone, page_bytes=args.page_bytes,
-                    wait=args.wait, max_gen=args.max_gen)
+                    wait=args.wait, max_gen=args.max_gen,
+                    usage_string=make_usage_string(args.zone, args.host, args.port))
     run_udp_server(server, args.host, args.port)
 
 

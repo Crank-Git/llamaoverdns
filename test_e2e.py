@@ -497,6 +497,52 @@ class TestReplySizeE2E(unittest.TestCase):
                     self.assertIn("ANSWER: 0", out)
 
 
+def _lan_address():
+    """A non-loopback IPv4 address of this machine, or None."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("192.0.2.1", 9))  # TEST-NET-1; nothing is sent
+        addr = s.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        s.close()
+    return None if addr.startswith("127.") else addr
+
+
+class TestDefaultsE2E(unittest.TestCase):
+    """server.py with no --host/--port: loopback only, port 5300."""
+
+    def test_default_bind(self):
+        try:
+            probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            probe.bind(("127.0.0.1", 5300))
+            probe.close()
+        except OSError:
+            self.skipTest("port 5300 is in use on this machine")
+        proc = subprocess.Popen(
+            [sys.executable, "-u", "server.py", "--backend", "llamacpp",
+             "--url", "http://127.0.0.1:1"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        try:
+            self.assertIn("listening on udp 127.0.0.1:5300", proc.stdout.readline())
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(5)
+            s.sendto(build_query("e.com"), ("127.0.0.1", 5300))
+            _, _, answers, _, _ = parse_message(s.recvfrom(4096)[0])
+            self.assertIn("dig @127.0.0.1 -p 5300 +short", _decode_txt(answers[0]["rdata"]))
+            lan = _lan_address()
+            if lan:  # not reachable from the network by default
+                s.settimeout(1)
+                s.sendto(build_query("e.com"), (lan, 5300))
+                with self.assertRaises((socket.timeout, ConnectionRefusedError)):
+                    s.recvfrom(4096)
+            s.close()
+        finally:
+            proc.terminate()
+            proc.communicate(timeout=5)
+
+
 class TestDigE2E(unittest.TestCase):
     """Drive a real server.py subprocess with the real dig client."""
 
