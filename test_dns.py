@@ -21,6 +21,7 @@ from server import (
     build_query, build_txt_rdata, build_answer, build_opt, assemble_response,
     query_to_prompt, opt_to_bytes, split_txt, strip_thinking, _paginate,
     Server, GenerationManager, OllamaBackend, LlamaCppBackend,
+    SYSTEM_PROMPT, normalize_url, make_backend,
     TYPE_A, TYPE_NS, TYPE_SOA, TYPE_AAAA, TYPE_MX, TYPE_CNAME, DNSError,
 )
 
@@ -867,8 +868,9 @@ class _PromptStateFailed:
 class _StubServer:
     """Minimal HTTP server that records the POST body and returns canned bytes."""
 
-    def __init__(self, response_bytes):
+    def __init__(self, response_bytes, status=200):
         self.response_bytes = response_bytes
+        self.status = status
         self.received = None
         self.payload = None
         self.httpd = None
@@ -882,7 +884,7 @@ class _StubServer:
                 length = int(self.headers.get("Content-Length", 0))
                 server.received = self.rfile.read(length)
                 server.payload = json.loads(server.received)
-                self.send_response(200)
+                self.send_response(server.status)
                 self.send_header("Content-Length", str(len(server.response_bytes)))
                 self.end_headers()
                 self.wfile.write(server.response_bytes)
@@ -900,47 +902,213 @@ class _StubServer:
         self.httpd.shutdown()
 
 
+def _ndjson(*objs):
+    return b"".join(json.dumps(o).encode() + b"\n" for o in objs)
+
+
+def _sse(*objs, done=True):
+    out = b"".join(b"data: " + json.dumps(o).encode() + b"\n\n" for o in objs)
+    return out + (b"data: [DONE]\n\n" if done else b"")
+
+
+def _stream_from_stub(make_backend_for, body, status=200):
+    """Run a backend against a stub returning ``body``; return (chunks|exc, payload)."""
+    stub = _StubServer(body, status=status)
+    url = stub.start()
+    try:
+        try:
+            result = list(make_backend_for(url).stream("what is it"))
+        except Exception as e:  # the test inspects it
+            result = e
+        return result, stub.payload
+    finally:
+        stub.stop()
+
+
 class BackendTests(unittest.TestCase):
-    def test_ollama_backend_ndjson(self):
-        stub = _StubServer(
-            b'{"message":{"role":"assistant","content":"hello "}}\n'
-            b'{"message":{"role":"assistant","content":"world"}}\n'
-        )
+    # --- ollama -------------------------------------------------------------
+    def test_ollama_request_payload(self):
+        chunks, payload = _stream_from_stub(
+            lambda u: OllamaBackend(u, "llama3", max_tokens=42),
+            _ndjson({"message": {"role": "assistant", "content": "hi"}, "done": True}))
+        self.assertEqual(chunks, ["hi"])
+        self.assertEqual(payload, {
+            "model": "llama3",
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": "what is it"},
+            ],
+            "stream": True,
+            "think": False,
+            "options": {"num_predict": 42},
+        })
+
+    def test_ollama_stream_like_a_real_server(self):
+        # Shape of a real /api/chat stream: empty contents, a thinking field
+        # (ignored), and a final done object with stats.
+        body = _ndjson(
+            {"model": "m", "message": {"role": "assistant", "content": "", "thinking": "hmm"}, "done": False},
+            {"model": "m", "message": {"role": "assistant", "content": "hello "}, "done": False},
+            {"model": "m", "message": {"role": "assistant", "content": "world"}, "done": False},
+            {"model": "m", "message": {"role": "assistant", "content": ""}, "done": True,
+             "done_reason": "stop", "eval_count": 3},
+        ) + b"\n"
+        chunks, _ = _stream_from_stub(lambda u: OllamaBackend(u, "m"), body)
+        self.assertEqual(chunks, ["hello ", "world"])
+
+    def test_ollama_error_line_mid_stream_raises(self):
+        body = _ndjson({"message": {"content": "partial "}},
+                       {"error": "an error was encountered while running the model"})
+        result, _ = _stream_from_stub(lambda u: OllamaBackend(u, "m"), body)
+        self.assertIsInstance(result, RuntimeError)
+        self.assertEqual(str(result), "an error was encountered while running the model")
+
+    def test_ollama_http_error_body_is_surfaced(self):
+        result, _ = _stream_from_stub(lambda u: OllamaBackend(u, "nope"),
+                                      b'{"error":"model \'nope\' not found"}', status=404)
+        self.assertEqual(str(result), "HTTP 404: model 'nope' not found")
+
+    def test_ollama_mid_stream_error_reaches_dns_reply(self):
+        stub = _StubServer(_ndjson({"message": {"content": "partial answer"}},
+                                   {"error": "out of memory"}))
         url = stub.start()
         try:
-            backend = OllamaBackend(url, "llama3", max_tokens=42)
-            chunks = list(backend.stream("what is it"))
-            self.assertEqual("".join(chunks), "hello world")
-            self.assertEqual(stub.payload["model"], "llama3")
-            self.assertIn("plain text", stub.payload["system"])
-            self.assertTrue(stub.payload["stream"])
-            self.assertEqual(stub.payload["options"]["max_tokens"], 42)
+            server = Server(OllamaBackend(url, "m"), wait=2.0)
+            header, q = _make_question("oom.e.com")
+            self.assertEqual(_extract_txt(server.handle(header, [q], None)),
+                             "partial answer [error: out of memory]")
         finally:
             stub.stop()
 
-    def test_llamacpp_backend_sse(self):
-        stub = _StubServer(
-            b'data: {"choices":[{"delta":{"content":"foo"}}]}\n'
-            b'data: {"choices":[{"delta":{"content":"bar"}}]}\n'
-            b'data: [DONE]\n'
-        )
-        url = stub.start()
-        try:
-            backend = LlamaCppBackend(url, model="qwen", max_tokens=7)
-            chunks = list(backend.stream("do it"))
-            self.assertEqual("".join(chunks), "foobar")
-            self.assertEqual(stub.payload["max_tokens"], 7)
-            roles = [m["role"] for m in stub.payload["messages"]]
-            self.assertEqual(roles, ["system", "user"])
-        finally:
-            stub.stop()
+    # --- llama.cpp ----------------------------------------------------------
+    def test_llamacpp_request_payload(self):
+        body = _sse({"choices": [{"delta": {"content": "x"}}]})
+        _, payload = _stream_from_stub(lambda u: LlamaCppBackend(u, model="qwen", max_tokens=7), body)
+        self.assertEqual(payload, {
+            "model": "qwen",
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": "what is it"},
+            ],
+            "stream": True,
+            "max_tokens": 7,
+            "chat_template_kwargs": {"enable_thinking": False},
+        })
 
-    def test_backend_error_is_raised(self):
-        # A non-2xx / connection failure should surface as an exception so the
-        # manager records it as [error: ...] rather than crashing.
+    def test_llamacpp_model_omitted_when_not_given(self):
+        body = _sse({"choices": [{"delta": {"content": "x"}}]})
+        _, payload = _stream_from_stub(lambda u: LlamaCppBackend(u), body)
+        self.assertNotIn("model", payload)
+
+    def test_llamacpp_stream_like_a_real_server(self):
+        # Copied from a real llama-server stream: a role-only first chunk with
+        # "content": null, reasoning_content, a finish chunk with an empty
+        # delta, and a usage chunk with no choices.
+        body = _sse(
+            {"choices": [{"finish_reason": None, "index": 0,
+                          "delta": {"role": "assistant", "content": None}}],
+             "object": "chat.completion.chunk"},
+            {"choices": [{"index": 0, "delta": {"reasoning_content": "hmm"}}]},
+            {"choices": [{"index": 0, "delta": {"content": "foo"}}]},
+            {"choices": [{"index": 0, "delta": {"content": "bar"}}]},
+            {"choices": [{"finish_reason": "stop", "index": 0, "delta": {}}]},
+            {"choices": [], "usage": {"completion_tokens": 2}},
+        )
+        chunks, _ = _stream_from_stub(lambda u: LlamaCppBackend(u), body)
+        self.assertEqual(chunks, ["foo", "bar"])
+
+    def test_llamacpp_stream_without_done_marker(self):
+        body = _sse({"choices": [{"delta": {"content": "ok"}}]}, done=False)
+        chunks, _ = _stream_from_stub(lambda u: LlamaCppBackend(u), body)
+        self.assertEqual(chunks, ["ok"])
+
+    def test_llamacpp_error_event_raises(self):
+        body = _sse({"choices": [{"delta": {"content": "a"}}]},
+                    {"error": {"code": 500, "message": "context full", "type": "server_error"}})
+        result, _ = _stream_from_stub(lambda u: LlamaCppBackend(u), body)
+        self.assertEqual(str(result), "context full")
+
+    def test_llamacpp_http_error_body_is_surfaced(self):
+        body = b'{"error":{"code":400,"message":"bad request: messages empty","type":"invalid_request_error"}}'
+        result, _ = _stream_from_stub(lambda u: LlamaCppBackend(u), body, status=400)
+        self.assertEqual(str(result), "HTTP 400: bad request: messages empty")
+
+    # --- both ---------------------------------------------------------------
+    def test_http_error_without_json_uses_reason(self):
+        result, _ = _stream_from_stub(lambda u: OllamaBackend(u, "m"), b"<html>oops</html>", status=502)
+        self.assertEqual(str(result), "HTTP 502: Bad Gateway")
+
+    def test_unreachable_backend_message(self):
         backend = OllamaBackend("http://127.0.0.1:1", "x", timeout=1)
-        with self.assertRaises(Exception):
+        with self.assertRaises(RuntimeError) as cm:
             list(backend.stream("anything"))
+        self.assertIn("cannot reach http://127.0.0.1:1/api/chat", str(cm.exception))
+
+
+class BackendConfig(unittest.TestCase):
+    URLS = [
+        # (given, default port, expected)
+        ("localhost", 11434, "http://localhost:11434"),
+        ("0.0.0.0:11434", 11434, "http://0.0.0.0:11434"),
+        ("192.168.1.215", 11434, "http://192.168.1.215:11434"),
+        ("192.168.1.215:9999", 11434, "http://192.168.1.215:9999"),
+        ("[::1]", 11434, "http://[::1]:11434"),
+        ("[::1]:8080", 11434, "http://[::1]:8080"),
+        ("http://localhost:11434", 11434, "http://localhost:11434"),
+        ("http://localhost:11434/", 11434, "http://localhost:11434"),
+        ("https://ollama.example.com", 11434, "https://ollama.example.com"),
+        ("  localhost:8080 ", 8080, "http://localhost:8080"),
+    ]
+
+    def test_normalize_url(self):
+        for given, port, expected in self.URLS:
+            with self.subTest(given=given):
+                self.assertEqual(normalize_url(given, port), expected)
+
+    def test_normalize_url_rejects_bad_port(self):
+        with self.assertRaises(SystemExit):
+            normalize_url("localhost:notaport", 11434)
+
+    def _make(self, argv, env=None):
+        import argparse
+        from unittest import mock
+        p = argparse.ArgumentParser()
+        p.add_argument("--backend", default="ollama")
+        p.add_argument("--url")
+        p.add_argument("--model")
+        p.add_argument("--max-tokens", type=int, default=256)
+        with mock.patch.dict("os.environ", env or {}, clear=True):
+            return make_backend(p.parse_args(argv))
+
+    def test_make_backend_ollama_host_forms(self):
+        cases = [
+            ({}, "http://localhost:11434"),
+            ({"OLLAMA_HOST": "0.0.0.0"}, "http://0.0.0.0:11434"),
+            ({"OLLAMA_HOST": "brain:11434"}, "http://brain:11434"),
+            ({"OLLAMA_HOST": "http://brain:11434"}, "http://brain:11434"),
+        ]
+        for env, expected in cases:
+            with self.subTest(env=env):
+                b = self._make(["--model", "m"], env)
+                self.assertIsInstance(b, OllamaBackend)
+                self.assertEqual(b.url, expected)
+
+    def test_make_backend_url_overrides_env(self):
+        b = self._make(["--model", "m", "--url", "otherhost"], {"OLLAMA_HOST": "brain"})
+        self.assertEqual(b.url, "http://otherhost:11434")
+
+    def test_make_backend_ollama_requires_model(self):
+        with self.assertRaises(SystemExit):
+            self._make([])
+
+    def test_make_backend_llamacpp(self):
+        b = self._make(["--backend", "llamacpp", "--max-tokens", "9"])
+        self.assertIsInstance(b, LlamaCppBackend)
+        self.assertEqual(b.url, "http://localhost:8080")
+        self.assertIsNone(b.model)
+        self.assertEqual(b.max_tokens, 9)
+        self.assertEqual(self._make(["--backend", "llamacpp", "--url", "box:9000"]).url,
+                         "http://box:9000")
 
 
 # --- client.py pure logic (Phase 5) ------------------------------------------

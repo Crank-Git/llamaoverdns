@@ -650,44 +650,65 @@ def opt_to_bytes(opt):
 # Both implement the one interface: stream(prompt) -> iterator of text chunks.
 # The DNS/caching code never needs to know which one is in use.
 import json
+import os
+import urllib.error
+import urllib.parse
 import urllib.request
+
+# Seconds to wait to connect and between streamed lines. Generous, because the
+# first request after a model is loaded can stall while it loads (tens of
+# seconds on small boards).
+BACKEND_TIMEOUT = 120
+
+OLLAMA_DEFAULT_PORT = 11434
+
+
+def normalize_url(url, default_port):
+    """Accept ``host``, ``host:port`` or a full URL, the forms OLLAMA_HOST uses.
+
+    Without a scheme, ``http://`` is assumed and a missing port becomes
+    ``default_port`` (``localhost`` -> ``http://localhost:11434``), matching
+    Ollama's own client. A URL with a scheme is used as given.
+    """
+    url = url.strip().rstrip("/")
+    if "://" in url:
+        return url
+    try:
+        port = urllib.parse.urlsplit("http://" + url).port
+    except ValueError:
+        raise SystemExit(f"invalid backend address: {url!r}")
+    if port is None:
+        url = f"{url}:{default_port}"
+    return "http://" + url
+
+
+def _error_text(obj):
+    """Pull a message out of an error object (Ollama: str; OpenAI: dict)."""
+    err = obj.get("error") if isinstance(obj, dict) else None
+    if isinstance(err, dict):
+        err = err.get("message")
+    return str(err) if err else None
+
+
+def _open(req, timeout):
+    """urlopen that turns HTTP and connection failures into short messages."""
+    try:
+        return urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        body = e.read(4096)
+        try:
+            detail = _error_text(json.loads(body))
+        except ValueError:
+            detail = None
+        raise RuntimeError(f"HTTP {e.code}: {detail or e.reason}") from None
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"cannot reach {req.full_url}: {e.reason}") from None
 
 
 class OllamaBackend:
     """ollama: POST /api/chat with stream:true, NDJSON output."""
 
-    def __init__(self, url, model, max_tokens=256, timeout=30):
-        self.url = url.rstrip("/")
-        self.model = model
-        self.max_tokens = max_tokens
-        self.timeout = timeout
-
-    def stream(self, prompt):
-        payload = {
-            "model": self.model,
-            "system": SYSTEM_PROMPT,
-            "messages": [{"role": "user", "content": prompt}],
-            "stream": True,
-            "options": {"max_tokens": self.max_tokens},
-        }
-        req = urllib.request.Request(
-            self.url + "/api/chat",
-            data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-            for line in resp:
-                line = line.strip()
-                if not line:
-                    continue
-                obj = json.loads(line)
-                yield obj.get("message", {}).get("content", "")
-
-
-class LlamaCppBackend:
-    """llama-server: POST /v1/chat/completions with stream:true, SSE output."""
-
-    def __init__(self, url, model=None, max_tokens=256, timeout=30):
+    def __init__(self, url, model, max_tokens=256, timeout=BACKEND_TIMEOUT):
         self.url = url.rstrip("/")
         self.model = model
         self.max_tokens = max_tokens
@@ -701,14 +722,60 @@ class LlamaCppBackend:
                 {"role": "user", "content": prompt},
             ],
             "stream": True,
-            "max_tokens": self.max_tokens,
+            # Thinking models would otherwise spend the token budget on
+            # reasoning (returned separately in message.thinking) and leave
+            # the answer empty. Models that can't think accept this too.
+            "think": False,
+            "options": {"num_predict": self.max_tokens},
         }
+        req = urllib.request.Request(
+            self.url + "/api/chat",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with _open(req, self.timeout) as resp:
+            for line in resp:
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                err = _error_text(obj)
+                if err:
+                    raise RuntimeError(err)
+                content = (obj.get("message") or {}).get("content")
+                if content:
+                    yield content
+
+
+class LlamaCppBackend:
+    """llama-server: POST /v1/chat/completions with stream:true, SSE output."""
+
+    def __init__(self, url, model=None, max_tokens=256, timeout=BACKEND_TIMEOUT):
+        self.url = url.rstrip("/")
+        self.model = model
+        self.max_tokens = max_tokens
+        self.timeout = timeout
+
+    def stream(self, prompt):
+        payload = {
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            "stream": True,
+            "max_tokens": self.max_tokens,
+            # Qwen3-style templates read this to skip the reasoning block;
+            # templates that don't use it ignore it.
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+        if self.model:
+            payload["model"] = self.model
         req = urllib.request.Request(
             self.url + "/v1/chat/completions",
             data=json.dumps(payload).encode(),
             headers={"Content-Type": "application/json"},
         )
-        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+        with _open(req, self.timeout) as resp:
             for line in resp:
                 line = line.strip()
                 if not line.startswith(b"data:"):
@@ -717,7 +784,18 @@ class LlamaCppBackend:
                 if data == b"[DONE]":
                     break
                 obj = json.loads(data)
-                yield obj["choices"][0].get("delta", {}).get("content", "")
+                err = _error_text(obj)
+                if err:
+                    raise RuntimeError(err)
+                # The first chunk carries only the role ("content": null) and a
+                # usage chunk can have no choices at all; skip both. Reasoning
+                # sent as delta.reasoning_content is ignored.
+                choices = obj.get("choices") or []
+                if not choices:
+                    continue
+                content = (choices[0].get("delta") or {}).get("content")
+                if content:
+                    yield content
 
 
 def make_backend(args):
@@ -725,10 +803,10 @@ def make_backend(args):
     if args.backend == "ollama":
         if not args.model:
             raise SystemExit("ollama backend requires --model")
-        import os
-        url = args.url or os.environ.get("OLLAMA_HOST") or "http://localhost:11434"
-        return OllamaBackend(url, args.model, max_tokens=args.max_tokens)
-    url = args.url or "http://localhost:8080"
+        url = args.url or os.environ.get("OLLAMA_HOST") or "localhost"
+        return OllamaBackend(normalize_url(url, OLLAMA_DEFAULT_PORT), args.model,
+                             max_tokens=args.max_tokens)
+    url = normalize_url(args.url or "localhost", 8080)
     return LlamaCppBackend(url, model=args.model, max_tokens=args.max_tokens)
 
 
