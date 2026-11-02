@@ -437,11 +437,14 @@ class GenerationManager:
             self._evict_locked()
             key = self._key(prompt)
             state = self._states.get(key)
-            if state is not None:
+            if state is not None and state.error is None:
                 self._states.move_to_end(key)
                 return state, None
+            # No entry, or a failed one: a failure is never reused, so a
+            # backend that comes back is used on the very next query.
             if self._active >= self.max_gen:
                 return None, "busy, try again"
+            self._states.pop(key, None)  # re-insert at the newest end
             state = _PromptState(prompt)
             self._states[key] = state
             self._active += 1
@@ -503,14 +506,15 @@ class GenerationManager:
                 done = state.done
                 error = state.error
             pages = _paginate(text, page_bytes)
-            if page < len(pages):
-                page_text = pages[page]
-                is_last = page == len(pages) - 1
-            else:
-                page_text = b""
-                is_last = False
+            page_text = pages[page] if page < len(pages) else b""
+            more_after = page < len(pages) - 1
+            # A page is final once text exists past it. A page of exactly
+            # page_bytes is final too: nothing can be added to it. (A page cut
+            # short to keep a multi-byte character whole is final only once
+            # the next page exists.)
+            full = more_after or len(page_text) == page_bytes
 
-            if done or len(page_text) == page_bytes or time.monotonic() >= deadline:
+            if done or full or time.monotonic() >= deadline:
                 break
             time.sleep(0.02)
 
@@ -518,15 +522,18 @@ class GenerationManager:
         # appended (the status tells the client whether to page forward, wait,
         # or that generation finished).
         page_text_str = page_text.decode("utf-8", "replace")
-        if error and not page_text:
-            status = f"[error: {error}]"
-        elif done:
-            if is_last or not page_text:
-                status = "[done]"
+        more = f"[more: dig p{page + 1}.{page_base} TXT]"
+        if done:
+            if more_after:
+                status = more
+            elif error:
+                # The last page of a failed generation: show what was produced,
+                # then the error, so a truncated answer never looks complete.
+                status = f"[error: {error}]"
             else:
-                status = f"[more: dig p{page + 1}.{page_base} TXT]"
-        elif len(page_text) == page_bytes:
-            status = f"[more: dig p{page + 1}.{page_base} TXT]"
+                status = "[done]"
+        elif full:
+            status = more
         else:
             status = "[thinking... repeat the same query]"
         if page_text_str:
