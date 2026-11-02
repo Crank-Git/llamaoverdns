@@ -320,6 +320,147 @@ class SliceTests(unittest.TestCase):
         self.assertEqual(strip_thinking("hi <think>still thinking"), "hi ")
 
 
+# --- Streamed thinking output -------------------------------------------------
+class _SnapshotBackend:
+    """Yields ``chunks`` and records the manager's ``state.text`` after each one.
+
+    The generator only resumes after ``_run`` has stored the previous chunk, so
+    each snapshot is exactly what a DNS query would have been served then.
+    """
+
+    def __init__(self, chunks, fail_after=False):
+        self.chunks = chunks
+        self.fail_after = fail_after
+        self.snapshots = []
+        self.manager = None
+
+    def stream(self, prompt):
+        state = self.manager._states[self.manager._key(prompt)]
+        for chunk in self.chunks:
+            yield chunk
+            with state.lock:
+                self.snapshots.append(state.text)
+        if self.fail_after:
+            raise RuntimeError("backend died")
+
+
+def _stream_through_manager(chunks, fail_after=False):
+    backend = _SnapshotBackend(chunks, fail_after)
+    manager = GenerationManager(backend)
+    backend.manager = manager
+    state, _ = manager.get_or_start("p")
+    deadline = time.monotonic() + 5
+    while not state.done and time.monotonic() < deadline:
+        time.sleep(0.005)
+    return backend.snapshots, state
+
+
+class StreamedThinking(unittest.TestCase):
+    RAW = "<think>\nSECRET plan: check that x < y\n</think>\n\nThe answer is 42 <3"
+    ANSWER = "The answer is 42 <3"
+
+    def assertNeverLeaks(self, snapshots, final):
+        for i, snap in enumerate(snapshots):
+            self.assertNotIn("SECRET", snap, f"snapshot {i}")
+            self.assertNotIn("think", snap, f"snapshot {i}")
+            # Served text only ever grows: a page sent earlier stays valid.
+            self.assertTrue(final.startswith(snap), f"snapshot {i} {snap!r} not a prefix of {final!r}")
+
+    def test_one_character_per_chunk(self):
+        snapshots, state = _stream_through_manager(list(self.RAW))
+        self.assertEqual(len(snapshots), len(self.RAW))
+        self.assertEqual(state.text, self.ANSWER)
+        self.assertNeverLeaks(snapshots, state.text)
+
+    def test_tokenized_like_a_real_model(self):
+        # Roughly how a tokenizer splits it: the tags arrive as their own tokens.
+        chunks = ["<think>", "\n", "SECRET", " plan", ":", " check", " that", " x", " <", " y",
+                  "\n", "</think>", "\n\n", "The", " answer", " is", " 42", " <", "3"]
+        self.assertEqual("".join(chunks), self.RAW)
+        snapshots, state = _stream_through_manager(chunks)
+        self.assertEqual(state.text, self.ANSWER)
+        self.assertNeverLeaks(snapshots, state.text)
+
+    def test_every_two_and_three_way_split(self):
+        raw = "<think>SECRET</think>ok <b"
+        for i in range(1, len(raw)):
+            for j in range(i + 1, len(raw)):
+                chunks = [raw[:i], raw[i:j], raw[j:]]
+                with self.subTest(chunks=chunks):
+                    snapshots, state = _stream_through_manager(chunks)
+                    self.assertEqual(state.text, "ok <b")
+                    self.assertNeverLeaks(snapshots, state.text)
+
+    def test_partial_tag_is_never_served(self):
+        snapshots, state = _stream_through_manager(["Hello <th", "ink>SECRET</think> world"])
+        self.assertEqual(snapshots[0], "Hello ")
+        self.assertEqual(state.text, "Hello  world")
+
+    def test_partial_tag_at_end_is_kept(self):
+        # Text that only looks like the start of a tag must survive once
+        # generation is over.
+        for tail in ("<", "<t", "<thin", "<think"):
+            with self.subTest(tail=tail):
+                _, state = _stream_through_manager(["a ", tail])
+                self.assertEqual(state.text, "a " + tail)
+
+    def test_unclosed_block_at_end_is_dropped(self):
+        snapshots, state = _stream_through_manager(["ok ", "<think>", "SECRET", " still going"])
+        self.assertEqual(state.text, "ok ")
+        self.assertNeverLeaks(snapshots, state.text)
+
+    def test_several_blocks(self):
+        chunks = list("<think>SECRET1</think>one <think>SECRET2</think>two")
+        snapshots, state = _stream_through_manager(chunks)
+        self.assertEqual(state.text, "one two")
+        self.assertNeverLeaks(snapshots, state.text)
+
+    def test_error_mid_block_keeps_only_clean_text(self):
+        _, state = _stream_through_manager(["Hi ", "<think>", "SECRET"], fail_after=True)
+        self.assertEqual(state.text, "Hi ")
+        self.assertEqual(state.error, "backend died")
+
+    def test_empty_chunks_ignored(self):
+        _, state = _stream_through_manager(["", "a", "", "b", ""])
+        self.assertEqual(state.text, "ab")
+
+    def test_served_pages_never_contain_thinking(self):
+        # Poll the real Server.handle while a slow, character-by-character
+        # thinking stream is generating, as repeated dig queries would.
+        raw = self.RAW
+
+        class Trickle:
+            def stream(self, prompt):
+                for c in raw:
+                    time.sleep(0.003)
+                    yield c
+
+        server = Server(Trickle(), wait=0)
+        header, q = _make_question("leak.e.com")
+        replies = []
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            reply = _extract_txt(server.handle(header, [q], None))
+            replies.append(reply)
+            if "[done]" in reply:
+                break
+            time.sleep(0.002)
+        self.assertIn("[done]", replies[-1])
+        self.assertGreater(len(replies), 10)  # really polled mid-stream
+        for r in replies:
+            self.assertNotIn("SECRET", r)
+            self.assertNotIn("think>", r)
+        self.assertTrue(replies[-1].startswith(self.ANSWER + " "))
+
+    def test_strip_thinking_holdback_only_when_not_final(self):
+        self.assertEqual(strip_thinking("x <thi", final=False), "x ")
+        self.assertEqual(strip_thinking("x <thi", final=True), "x <thi")
+        self.assertEqual(strip_thinking("x <thi"), "x <thi")  # final is the default
+
+    def test_strip_thinking_drops_leading_whitespace(self):
+        self.assertEqual(strip_thinking("<think>a</think>\n\n  Answer\n"), "Answer\n")
+
+
 # --- Server + generation (Phase 3) -------------------------------------------
 class FakeBackend:
     """Canned backend: yields preset chunks per prompt, counting stream calls."""

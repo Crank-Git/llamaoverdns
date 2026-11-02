@@ -360,21 +360,40 @@ _THINK_START = "<think>"
 _THINK_END = "</think>"
 
 
-def strip_thinking(text):
-    """Remove closed <think> blocks; truncate at an open one."""
+def strip_thinking(text, final=True):
+    """Remove closed <think> blocks; truncate at an open one.
+
+    ``text`` must be the *raw* model output accumulated so far, never output
+    that was already stripped: stripping an open block drops its ``<think>``
+    tag, so stripping again would expose the thinking text after it.
+
+    While generation is still running (``final=False``), a trailing partial
+    ``<think>`` tag (``"<"``, ``"<th"``, ...) is held back because the next
+    chunk may complete it. When generation is over (``final=True``) it is kept,
+    so an answer that really ends in ``"<"`` is not cut short.
+
+    Leading whitespace is dropped: models usually put a blank line after
+    ``</think>``.
+    """
     out = []
     i = 0
-    n = len(text)
-    while i < n:
-        if text.startswith(_THINK_START, i):
-            close = text.find(_THINK_END, i + len(_THINK_START))
-            if close == -1:
-                break  # open block: drop everything from here on
-            i = close + len(_THINK_END)
-            continue
-        out.append(text[i])
-        i += 1
-    return "".join(out)
+    while True:
+        start = text.find(_THINK_START, i)
+        if start == -1:
+            out.append(text[i:])
+            break
+        out.append(text[i:start])
+        close = text.find(_THINK_END, start + len(_THINK_START))
+        if close == -1:
+            break  # open block: drop everything from here on
+        i = close + len(_THINK_END)
+    result = "".join(out).lstrip()
+    if not final:
+        for k in range(len(_THINK_START) - 1, 0, -1):
+            if result.endswith(_THINK_START[:k]):
+                result = result[:-k]
+                break
+    return result
 
 
 # --- Generation manager (Phase 3) --------------------------------------------
@@ -431,14 +450,22 @@ class GenerationManager:
         return state, None
 
     def _run(self, state):
+        raw = ""  # unstripped output; state.text is always derived from this
         try:
             for chunk in self.backend.stream(state.prompt):
-                state.text = strip_thinking(state.text + chunk)
+                if not chunk:
+                    continue
+                raw += chunk
+                text = strip_thinking(raw, final=False)
+                with state.lock:
+                    state.text = text
             with state.lock:
+                state.text = strip_thinking(raw, final=True)
                 state.done = True
                 state.finished_time = time.monotonic()
         except Exception as e:  # never let a backend error take us down
             with state.lock:
+                state.text = strip_thinking(raw, final=True)
                 state.error = str(e) or type(e).__name__
                 state.done = True
                 state.finished_time = time.monotonic()
