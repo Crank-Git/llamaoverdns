@@ -648,6 +648,221 @@ class ServerTests(unittest.TestCase):
         server.manager.fetch_page(state, 0, 600, 0.2, "z.e.com")
 
 
+# --- Generation cache and paging status -------------------------------------
+class _Gate:
+    """Backend that yields ``before``, blocks until released, then yields
+    ``after`` (or raises). Lets a test hold a generation open exactly as long as
+    it needs, with no sleeps that guess at timing."""
+
+    def __init__(self, before, after=(), fail=None):
+        self.before, self.after, self.fail = before, after, fail
+        self.release = threading.Event()
+        self.stream_calls = 0
+
+    def stream(self, prompt):
+        self.stream_calls += 1
+        yield from self.before
+        self.release.wait(10)
+        yield from self.after
+        if self.fail:
+            raise RuntimeError(self.fail)
+
+
+def _wait_until(pred, timeout=5):
+    deadline = time.monotonic() + timeout
+    while not pred():
+        if time.monotonic() > deadline:
+            raise AssertionError("condition not reached")
+        time.sleep(0.005)
+
+
+class CacheAndPaging(unittest.TestCase):
+    def test_failed_generation_is_not_reused(self):
+        class Flaky:
+            calls = 0
+            def stream(self, prompt):
+                Flaky.calls += 1
+                if Flaky.calls == 1:
+                    raise ConnectionRefusedError("backend down")
+                yield "back up"
+        server = Server(Flaky(), wait=1.0)
+        header, q = _make_question("hi.e.com")
+        self.assertEqual(_extract_txt(server.handle(header, [q], None)), "[error: backend down]")
+        self.assertEqual(_extract_txt(server.handle(header, [q], None)), "back up [done]")
+        self.assertEqual(Flaky.calls, 2)
+        # ...and the good result is cached as usual.
+        server.handle(header, [q], None)
+        self.assertEqual(Flaky.calls, 2)
+
+    def test_retry_after_error_is_still_bounded_by_max_gen(self):
+        hold = _Gate(["x"])
+        mgr = GenerationManager(hold, max_gen=1)
+        failed = _PromptStateFailed("p")
+        mgr._states[mgr._key("p")] = failed
+        busy, _ = mgr.get_or_start("other")           # takes the only slot
+        state, err = mgr.get_or_start("p")            # retry of the failed prompt
+        self.assertIsNone(state)
+        self.assertEqual(err, "busy, try again")
+        hold.release.set()
+
+    def test_multibyte_page_edge_reports_more_without_waiting(self):
+        # Page 0 is "aaaaaaaaa" (9 bytes): the euro sign moved to page 1. The
+        # generation is still running; page 0 must still be reported full.
+        gate = _Gate(["a" * 9 + "\u20ac" + "b" * 10])
+        mgr = GenerationManager(gate)
+        state, _ = mgr.get_or_start("p")
+        _wait_until(lambda: state.text)
+        start = time.monotonic()
+        reply = mgr.fetch_page(state, 0, 10, 3.0, "p.e.com")
+        self.assertLess(time.monotonic() - start, 0.5)
+        self.assertEqual(reply, "aaaaaaaaa [more: dig p1.p.e.com TXT]")
+        gate.release.set()
+
+    def test_exactly_full_page_reports_more_while_generating(self):
+        gate = _Gate(["a" * 10])
+        mgr = GenerationManager(gate)
+        state, _ = mgr.get_or_start("p")
+        _wait_until(lambda: state.text)
+        start = time.monotonic()
+        self.assertEqual(mgr.fetch_page(state, 0, 10, 3.0, "p.e.com"),
+                         "a" * 10 + " [more: dig p1.p.e.com TXT]")
+        self.assertLess(time.monotonic() - start, 0.5)
+        gate.release.set()
+
+    def test_short_page_waits_then_reports_thinking(self):
+        gate = _Gate(["abc"])
+        mgr = GenerationManager(gate)
+        state, _ = mgr.get_or_start("p")
+        _wait_until(lambda: state.text)
+        start = time.monotonic()
+        self.assertEqual(mgr.fetch_page(state, 0, 10, 0.3, "p.e.com"),
+                         "abc [thinking... repeat the same query]")
+        self.assertGreaterEqual(time.monotonic() - start, 0.3)
+        gate.release.set()
+
+    def test_page_fills_while_waiting(self):
+        # The page is short when the query arrives and fills during the wait.
+        gate = _Gate(["abc"], after=["defghijklmn"])
+        mgr = GenerationManager(gate)
+        state, _ = mgr.get_or_start("p")
+        _wait_until(lambda: state.text)
+        threading.Timer(0.1, gate.release.set).start()
+        self.assertEqual(mgr.fetch_page(state, 0, 10, 3.0, "p.e.com"),
+                         "abcdefghij [more: dig p1.p.e.com TXT]")
+
+    def test_partial_failure_shows_error_on_last_page(self):
+        gate = _Gate(["a" * 15], fail="backend died")
+        gate.release.set()
+        mgr = GenerationManager(gate)
+        state, _ = mgr.get_or_start("p")
+        _wait_until(lambda: state.done)
+        self.assertEqual(mgr.fetch_page(state, 0, 10, 1, "p.e.com"),
+                         "a" * 10 + " [more: dig p1.p.e.com TXT]")
+        self.assertEqual(mgr.fetch_page(state, 1, 10, 1, "p.e.com"),
+                         "aaaaa [error: backend died]")
+        self.assertEqual(mgr.fetch_page(state, 2, 10, 1, "p.e.com"),
+                         "[error: backend died]")
+
+    def test_failure_before_any_text(self):
+        gate = _Gate([], fail="model not found")
+        gate.release.set()
+        mgr = GenerationManager(gate)
+        state, _ = mgr.get_or_start("p")
+        self.assertEqual(mgr.fetch_page(state, 0, 10, 1, "p.e.com"), "[error: model not found]")
+
+    def test_successful_last_page_and_past_the_end(self):
+        backend = FakeBackend({"p": ["a" * 15]})
+        mgr = GenerationManager(backend)
+        state, _ = mgr.get_or_start("p")
+        _wait_until(lambda: state.done)
+        self.assertEqual(mgr.fetch_page(state, 1, 10, 1, "p.e.com"), "aaaaa [done]")
+        self.assertEqual(mgr.fetch_page(state, 5, 10, 1, "p.e.com"), "[done]")
+
+    def test_ttl_expires_finished_entries(self):
+        backend = FakeBackend({"p": ["x"]})
+        mgr = GenerationManager(backend, cache_ttl=0.05)
+        state, _ = mgr.get_or_start("p")
+        _wait_until(lambda: state.done)
+        self.assertIs(mgr.get_or_start("p")[0], state)  # still fresh
+        time.sleep(0.1)
+        fresh, _ = mgr.get_or_start("p")
+        self.assertIsNot(fresh, state)
+        _wait_until(lambda: fresh.done)
+        self.assertEqual(backend.stream_calls, 2)
+
+    def test_ttl_never_expires_in_flight_work(self):
+        gate = _Gate(["x"])
+        mgr = GenerationManager(gate, cache_ttl=0)
+        state, _ = mgr.get_or_start("p")
+        time.sleep(0.05)
+        self.assertIs(mgr.get_or_start("p")[0], state)
+        self.assertEqual(gate.stream_calls, 1)
+        gate.release.set()
+
+    def test_entry_cap_evicts_oldest_finished(self):
+        backend = FakeBackend({k: ["x"] for k in "abc"})
+        mgr = GenerationManager(backend, max_entries=2)
+        for k in "abc":
+            st, _ = mgr.get_or_start(k)
+            _wait_until(lambda: st.done)
+        mgr.get_or_start("c")  # triggers eviction
+        self.assertEqual(len(mgr._states), 2)
+        self.assertNotIn(mgr._key("a"), mgr._states)
+
+    def test_entry_cap_never_evicts_in_flight(self):
+        gate = _Gate(["x"])
+        mgr = GenerationManager(gate, max_entries=1, max_gen=5)
+        states = [mgr.get_or_start(k)[0] for k in "abc"]
+        mgr.get_or_start("a")
+        self.assertEqual(len(mgr._states), 3)  # over the cap, but all running
+        self.assertEqual(gate.stream_calls, 3)
+        gate.release.set()
+        _wait_until(lambda: all(s.done for s in states))
+        mgr.get_or_start("a")
+        self.assertLessEqual(len(mgr._states), 1)
+
+    def test_concurrent_requests_for_one_prompt_start_one_generation(self):
+        gate = _Gate(["x"])
+        mgr = GenerationManager(gate, max_gen=1)
+        barrier = threading.Barrier(20)
+        results = []
+
+        def go():
+            barrier.wait()
+            results.append(mgr.get_or_start("same"))
+
+        threads = [threading.Thread(target=go) for _ in range(20)]
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+        self.assertEqual(gate.stream_calls, 1)
+        self.assertEqual({id(st) for st, err in results}, {id(results[0][0])})
+        self.assertTrue(all(err is None for _, err in results))
+        gate.release.set()
+
+    def test_slot_released_after_success_and_failure(self):
+        ok = _Gate(["x"]); ok.release.set()
+        bad = _Gate([], fail="boom"); bad.release.set()
+        for backend in (ok, bad):
+            with self.subTest(fail=backend.fail):
+                mgr = GenerationManager(backend, max_gen=1)
+                st, _ = mgr.get_or_start("p")
+                _wait_until(lambda: st.done)
+                _wait_until(lambda: mgr._active == 0)
+                self.assertIsNone(mgr.get_or_start("q")[1])
+
+
+class _PromptStateFailed:
+    """A finished, failed cache entry (as _run leaves one)."""
+
+    def __init__(self, prompt):
+        self.prompt = prompt
+        self.text = ""
+        self.done = True
+        self.error = "backend down"
+        self.finished_time = time.monotonic()
+        self.lock = threading.Lock()
+
+
 # --- Real backends against stub HTTP servers (Phase 4) -----------------------
 class _StubServer:
     """Minimal HTTP server that records the POST body and returns canned bytes."""
