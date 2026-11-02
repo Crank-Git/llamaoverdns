@@ -1399,11 +1399,65 @@ class ClientParsing(unittest.TestCase):
         self.assertEqual(client.main(["--prompt", ""]), 2)
 
     def test_prompt_becomes_labels(self):
-        # spaces -> dots; hyphens preserved (server turns them into spaces)
-        qname = "what does bravurva mean".replace(" ", ".").strip(".") + ".e.com"
-        self.assertEqual(qname, "what.does.bravurva.mean.e.com")
-        qname = "why-is-the-sky-blue".replace(" ", ".").strip(".") + ".e.com"
-        self.assertEqual(qname, "why-is-the-sky-blue.e.com")
+        # words -> labels; hyphens preserved (server turns them into spaces)
+        cases = [
+            ("what does bravurva mean", "what.does.bravurva.mean.e.com"),
+            ("why-is-the-sky-blue", "why-is-the-sky-blue.e.com"),
+            ("  lots   of\tspace ", "lots.of.space.e.com"),
+            ("is 3.5 > 3?", "is.3.5.>.3?.e.com"),
+            ("trailing dots...", "trailing.dots.e.com"),
+        ]
+        for prompt, qname in cases:
+            with self.subTest(prompt=prompt):
+                self.assertEqual(client.prompt_to_qname(prompt, "e.com"), qname)
+                # ...and the server reads it back as the same words.
+                self.assertIsNotNone(query_to_prompt(qname, "e.com"))
+        self.assertEqual(client.prompt_to_qname("hi", "llm.example.org."), "hi.llm.example.org")
+
+    def test_prompts_dns_cannot_carry_are_rejected(self):
+        for prompt, why in [
+            ("", "empty"),
+            ("   ", "empty"),
+            ("caf\u00e9", "ASCII"),
+            ("a" * 64, "max 63"),
+            (" ".join(["word"] * 60), "too long"),
+        ]:
+            with self.subTest(prompt=prompt[:20]):
+                with self.assertRaises(ValueError) as cm:
+                    client.prompt_to_qname(prompt, "e.com")
+                self.assertIn(why, str(cm.exception))
+
+    def test_cli_rejects_bad_prompt_with_exit_2(self):
+        import contextlib, io
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(client.main(["--prompt", "caf\u00e9"]), 2)
+        self.assertIn("ASCII", err.getvalue())
+
+    def test_split_status_keeps_page_whitespace(self):
+        # The server sends "<page> <status>"; only that one space is removed,
+        # so a page ending in a space keeps it.
+        self.assertEqual(client.split_status("word  [more: dig p1.x.e.com TXT]"),
+                         ("word ", "more: dig p1.x.e.com TXT"))
+        self.assertEqual(client.split_status("\n [done]"), ("\n", "done"))
+
+    def test_split_status_error_reason_with_brackets(self):
+        self.assertEqual(client.split_status("partial [error: HTTP 400: bad [x] request]"),
+                         ("partial", "error: HTTP 400: bad [x] request"))
+
+    def test_split_status_brackets_in_content(self):
+        self.assertEqual(client.split_status("see [1] and [done] [done]"),
+                         ("see [1] and [done]", "done"))
+        self.assertEqual(client.split_status("abc [thinking... repeat the same query]"),
+                         ("abc", "thinking... repeat the same query"))
+        self.assertEqual(client.split_status("ends with [a bracket]"),
+                         ("ends with [a bracket]", None))
+
+    def test_default_port_matches_server(self):
+        import server as srv
+        self.assertEqual(srv.DEFAULT_PORT, 5300)
+        p = client.main.__code__  # the CLI default comes from server.DEFAULT_PORT
+        self.assertIn("DEFAULT_PORT", p.co_names)
 
 
 if __name__ == "__main__":

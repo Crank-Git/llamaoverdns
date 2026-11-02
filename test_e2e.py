@@ -543,6 +543,190 @@ class TestDefaultsE2E(unittest.TestCase):
             proc.communicate(timeout=5)
 
 
+import client  # noqa: E402
+
+
+class _Paced:
+    """Streams ``text`` in small chunks with a delay, like a real model."""
+
+    def __init__(self, text, chunk=3, delay=0.004, fail=None):
+        self.text, self.chunk, self.delay, self.fail = text, chunk, delay, fail
+
+    def stream(self, prompt):
+        for i in range(0, len(self.text), self.chunk):
+            time.sleep(self.delay)
+            yield self.text[i:i + self.chunk]
+        if self.fail:
+            raise RuntimeError(self.fail)
+
+
+def _record_statuses(server):
+    """Wrap fetch_page to record the status of every reply the server sends."""
+    seen = []
+    original = server.manager.fetch_page
+
+    def fetch_page(*a, **kw):
+        reply = original(*a, **kw)
+        seen.append(client.split_status(reply)[1])
+        return reply
+
+    server.manager.fetch_page = fetch_page
+    return seen
+
+
+class TestClientE2E(unittest.TestCase):
+    """client.py against a real server: the answer must come back exactly."""
+
+    # Quotes, a backslash, curly punctuation, 2/3/4-byte characters, a newline,
+    # and words that a 37-byte page splits at spaces.
+    TEXT = ('He said "hello" \\ it\u2019s 42\u00b0C in \u6771\u4eac \U0001F999 \u2014 fine.\n'
+            "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu ") * 4
+
+    def test_answer_is_byte_for_byte_exact_through_thinking_and_paging(self):
+        # ~150 chars/s against a 0.15 s wait: a 37-byte page takes ~0.25 s to
+        # fill, so the client sees [thinking] and has to repeat.
+        server = Server(_Paced(self.TEXT, delay=0.02), page_bytes=37, wait=0.15)
+        statuses = _record_statuses(server)
+        with _Serving(server) as srv:
+            answer, error = client.fetch_answer("exact.e.com", *srv.addr, timeout=30)
+        self.assertIsNone(error)
+        self.assertEqual(answer, self.TEXT)
+        # The run really exercised both paths.
+        self.assertIn("done", statuses)
+        self.assertGreater(sum(1 for st in statuses if st.startswith("thinking")), 0)
+        self.assertGreater(sum(1 for st in statuses if st.startswith("more")), 5)
+
+    def test_page_ending_in_a_space_keeps_it(self):
+        text = "abcdefghi jklmnopqr stuvwxyz"  # page 0 is "abcdefghi " (10 bytes)
+        server = Server(_Paced(text), page_bytes=10, wait=1.0)
+        with _Serving(server) as srv:
+            answer, error = client.fetch_answer("space.e.com", *srv.addr)
+        self.assertEqual((answer, error), (text, None))
+
+    def test_cli_without_dig_on_path(self):
+        # The CLI as a subprocess with an empty PATH: no dig, same exact answer.
+        server = Server(_Paced(self.TEXT), page_bytes=200, wait=0.3)
+        with _Serving(server) as srv:
+            out = subprocess.run(
+                [sys.executable, "client.py", "--port", str(srv.addr[1]),
+                 "--prompt", "what is this"],
+                capture_output=True, timeout=60, env={"PATH": "", "PYTHONIOENCODING": "utf-8"})
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout.decode("utf-8"), self.TEXT + "\n")
+
+    def test_busy_is_retried_until_a_slot_frees(self):
+        hold = _Held()
+        server = Server(_RoutingBackend(hold, _Paced("finally mine")), max_gen=1, wait=0.5)
+        server.manager.get_or_start("other")  # takes the only slot
+        threading.Timer(1.0, hold.release.set).start()
+        statuses = _record_statuses(server)
+        with _Serving(server) as srv:
+            start = time.monotonic()
+            answer, error = client.fetch_answer("mine.e.com", *srv.addr, timeout=20)
+        self.assertEqual((answer, error), ("finally mine", None))
+        self.assertGreaterEqual(time.monotonic() - start, 0.9)
+
+    def test_mid_stream_error_prints_partial_and_exits_1(self):
+        server = Server(_Paced("partial answer ", fail="backend died"), wait=1.0)
+        with _Serving(server) as srv:
+            out = subprocess.run(
+                [sys.executable, "client.py", "--port", str(srv.addr[1]), "--prompt", "x"],
+                capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 1)
+        self.assertEqual(out.stdout, "partial answer \n")
+        self.assertEqual(out.stderr, "error: backend died\n")
+
+    def test_wrong_zone_reports_refused(self):
+        with _Serving(Server(_Paced("x"))) as srv:
+            answer, error = client.fetch_answer("x.wrong.org", *srv.addr)
+        self.assertEqual(answer, "")
+        self.assertIn("rcode 5", error)
+
+    def test_nothing_listening(self):
+        answer, error = client.fetch_answer("x.e.com", "127.0.0.1", _free_port(), timeout=5)
+        self.assertEqual(answer, "")
+        self.assertRegex(error, "nothing is listening|no reply")
+
+    def test_silent_server_times_out(self):
+        sink = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sink.bind(("127.0.0.1", 0))
+        try:
+            start = time.monotonic()
+            answer, error = client.fetch_answer("x.e.com", *sink.getsockname(),
+                                                timeout=1.0, query_timeout=0.3)
+            self.assertLess(time.monotonic() - start, 3)
+        finally:
+            sink.close()
+        self.assertEqual(answer, "")
+        self.assertRegex(error, "no reply|timed out")
+
+    def _fake_server(self, respond):
+        """A raw UDP responder: respond(query_bytes) -> list of reply packets."""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(("127.0.0.1", 0))
+        sock.settimeout(5)
+
+        def run():
+            try:
+                data, addr = sock.recvfrom(4096)
+                for reply in respond(data):
+                    sock.sendto(reply, addr)
+            except OSError:
+                pass
+
+        threading.Thread(target=run, daemon=True).start()
+        return sock
+
+    def test_truncated_reply_is_an_error(self):
+        from server import assemble_response
+
+        def respond(data):
+            header, questions, _, _, _ = parse_message(data)
+            return [assemble_response(header["id"], questions, [], tc=True)]
+
+        sock = self._fake_server(respond)
+        try:
+            _, error = client.fetch_answer("x.e.com", *sock.getsockname(), timeout=5)
+        finally:
+            sock.close()
+        self.assertIn("truncated", error)
+
+    def test_reply_with_wrong_id_is_ignored(self):
+        from server import assemble_response, build_txt_rdata
+
+        def respond(data):
+            header, questions, _, _, _ = parse_message(data)
+            rdata = build_txt_rdata(["right [done]"])
+            ans = b"\xc0\x0c" + struct.pack(">HHIH", TYPE_TXT, 1, 0, len(rdata)) + rdata
+            wrong = assemble_response((header["id"] + 1) & 0xFFFF, questions, [ans])
+            right = assemble_response(header["id"], questions, [ans])
+            return [wrong, b"garbage", right]
+
+        sock = self._fake_server(respond)
+        try:
+            self.assertEqual(client.fetch_answer("x.e.com", *sock.getsockname(), timeout=5),
+                             ("right", None))
+        finally:
+            sock.close()
+
+    def test_max_pages(self):
+        server = Server(_Paced("x" * 200, chunk=200, delay=0), page_bytes=10, wait=1.0)
+        with _Serving(server) as srv:
+            answer, error = client.fetch_answer("many.e.com", *srv.addr, max_pages=3)
+        self.assertEqual(answer, "x" * 30)
+        self.assertIn("--max-pages 3", error)
+
+
+class _RoutingBackend:
+    """Sends the prompt "other" to one backend and everything else to another."""
+
+    def __init__(self, other, mine):
+        self.other, self.mine = other, mine
+
+    def stream(self, prompt):
+        return (self.other if prompt == "other" else self.mine).stream(prompt)
+
+
 class TestDigE2E(unittest.TestCase):
     """Drive a real server.py subprocess with the real dig client."""
 
