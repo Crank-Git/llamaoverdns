@@ -438,6 +438,65 @@ class TestConcurrentServing(unittest.TestCase):
             self.assertLess(seconds, 3.0, name)  # serial would be ~1.6 / 3.2 / 4.8 s
 
 
+def _long_name(n):
+    """A valid name of exactly ``n`` characters under e.com."""
+    labels, room = [], n - len(".e.com")
+    while room > 0:
+        size = min(63, room - 2 if room - 63 == 1 else room)
+        labels.append("a" * size)
+        room -= size + 1
+    name = ".".join(labels) + ".e.com"
+    assert len(name) == n, len(name)
+    return name
+
+
+class TestReplySizeE2E(unittest.TestCase):
+    """Reply size against a real server.py, over a socket and with dig."""
+
+    NAME = _long_name(250)  # its next-page hint is exactly 253 characters
+
+    def test_longest_pageable_name_fits_1232(self):
+        with _ServerProcess(["x" * 700]) as srv:
+            reply = srv.query(_query_with_opt(self.NAME))
+        header, _, answers, _, opt = parse_message(reply)
+        self.assertLessEqual(len(reply), 1232)
+        self.assertFalse(header["tc"])
+        self.assertIn(f"[more: dig p1.{self.NAME} TXT]", _decode_txt(answers[0]["rdata"]))
+        self.assertEqual((opt["class"], opt["rdata"]), (1232, b""))
+
+    def _dig(self, port, *flags):
+        dig = shutil.which("dig")
+        if not dig:
+            self.skipTest("dig not available")
+        return subprocess.run([dig, "@127.0.0.1", "-p", str(port), self.NAME, "TXT", *flags],
+                              capture_output=True, text=True, timeout=15).stdout
+
+    @staticmethod
+    def _flags(out):
+        line = next(l for l in out.splitlines() if l.startswith(";; flags:"))
+        return line.split(";")[2].split(":")[1].split()
+
+    def test_dig_longest_name(self):
+        with _ServerProcess(["x" * 700]) as srv:
+            out = self._dig(srv.port)
+        size = int(out.split("MSG SIZE  rcvd: ")[1].split()[0])
+        self.assertLessEqual(size, 1232)
+        self.assertNotIn("tc", self._flags(out))
+        self.assertIn("[more: dig p1.", out)
+        self.assertIn("udp: 1232", out)  # our buffer size, not an echo of dig's
+        self.assertNotIn("COOKIE", out)  # dig's cookie is not echoed back
+        self.assertNotIn("Truncated", out)
+
+    def test_dig_small_buffer_and_no_edns_get_tc(self):
+        with _ServerProcess(["x" * 700]) as srv:
+            # +ignore: report the truncated UDP reply instead of retrying over TCP.
+            for flags in (("+bufsize=512", "+ignore"), ("+noedns", "+ignore")):
+                with self.subTest(flags=flags):
+                    out = self._dig(srv.port, *flags)
+                    self.assertIn("tc", self._flags(out))
+                    self.assertIn("ANSWER: 0", out)
+
+
 class TestDigE2E(unittest.TestCase):
     """Drive a real server.py subprocess with the real dig client."""
 

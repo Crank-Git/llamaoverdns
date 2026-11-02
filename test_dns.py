@@ -19,9 +19,9 @@ from server import (
     FLAG_QR, FLAG_AA, FLAG_RD,
     decode_name, encode_name, parse_header, parse_message,
     build_query, build_txt_rdata, build_answer, build_opt, assemble_response,
-    query_to_prompt, opt_to_bytes, split_txt, strip_thinking, _paginate,
+    query_to_prompt, split_txt, strip_thinking, _paginate,
     Server, GenerationManager, OllamaBackend, LlamaCppBackend,
-    SYSTEM_PROMPT, normalize_url, make_backend,
+    SYSTEM_PROMPT, normalize_url, make_backend, max_page_bytes, MAX_UDP,
     TYPE_A, TYPE_NS, TYPE_SOA, TYPE_AAAA, TYPE_MX, TYPE_CNAME, DNSError,
 )
 
@@ -267,6 +267,7 @@ class ResponseBuilding(unittest.TestCase):
         rdata = build_txt_rdata(["hello", "world"])
         ans = build_answer(qname, TYPE_TXT, rdata, ttl=0)
         resp = assemble_response(qid, questions, [ans], opt=build_opt())
+        self.assertEqual(build_opt(), b"\x00\x00\x29\x04\xd0" + b"\x00" * 6)
         rheader, rquestions, ranswers, _, ropt = parse_message(resp)
 
         self.assertTrue(rheader["qr"])
@@ -492,6 +493,10 @@ class SlowBackend:
         time.sleep(self.delay)
 
 
+# A parsed OPT record as dig sends it (EDNS0, 1232-byte buffer).
+EDNS_1232 = {"name": "", "type": TYPE_OPT, "class": 1232, "ttl": 0, "rdata": b""}
+
+
 def _make_question(name, qtype=TYPE_TXT):
     msg = build_query(name, qtype=qtype)
     header, questions, _, _, _ = parse_message(msg)
@@ -585,13 +590,13 @@ class ServerTests(unittest.TestCase):
         backend = FakeBackend({"multi": ["a" * 600, "b" * 600, "c" * 600]})
         server = Server(backend, page_bytes=600, wait=1.0)
         header, q = _make_question("p1.multi.e.com")
-        resp = server.handle(header, [q], None)
+        resp = server.handle(header, [q], EDNS_1232)  # a 600-byte page needs EDNS
         text = _extract_txt(resp)
         self.assertIn("[more: dig p2.multi.e.com TXT]", text)
         self.assertNotIn("p1.p1", text)
         # page 0 of the bare prompt also forwards from the core name
         header0, q0 = _make_question("multi.e.com")
-        resp0 = server.handle(header0, [q0], None)
+        resp0 = server.handle(header0, [q0], EDNS_1232)
         self.assertIn("[more: dig p1.multi.e.com TXT]", _extract_txt(resp0))
 
     def test_empty_output(self):
@@ -862,6 +867,219 @@ class _PromptStateFailed:
         self.error = "backend down"
         self.finished_time = time.monotonic()
         self.lock = threading.Lock()
+
+
+# --- Reply size, OPT and truncation --------------------------------------------
+def _name_of_len(n, zone="e.com"):
+    """A valid name of exactly ``n`` characters ending in ``zone``."""
+    room = n - len(zone) - 1
+    labels = []
+    while room > 0:
+        size = min(63, room)
+        if room - size == 1:  # never leave room for just a dot
+            size -= 1
+        labels.append("a" * size)
+        room -= size + 1
+    name = ".".join(labels + [zone])
+    assert len(name) == n, (n, len(name))
+    return name
+
+
+def _query(name, bufsize=None, version=0, do=False, options=b""):
+    """A wire query, with an OPT record when ``bufsize`` is given."""
+    msg = bytearray(build_query(name))
+    if bufsize is None:
+        return bytes(msg)
+    msg[10:12] = struct.pack(">H", 1)  # arcount = 1
+    ttl = (version << 16) | (0x8000 if do else 0)
+    return bytes(msg) + b"\x00" + struct.pack(">HHIH", TYPE_OPT, bufsize, ttl, len(options)) + options
+
+
+def _ask(server, wire):
+    header, questions, _, _, opt = parse_message(wire)
+    return server.handle(header, questions, opt)
+
+
+def _done_server(text="", fail=None, page_bytes=600, prompt_names=()):
+    """A Server whose generations for ``prompt_names`` have already finished."""
+    class Fixed:
+        def stream(self, prompt):
+            yield text
+            if fail:
+                raise RuntimeError(fail)
+    server = Server(Fixed(), page_bytes=page_bytes, wait=2.0, max_gen=1000)
+    for name in prompt_names:
+        prompt, _ = query_to_prompt(name, "e.com")
+        state, _ = server.manager.get_or_start(prompt)
+        _wait_until(lambda: state.done)
+    return server
+
+
+class ReplySize(unittest.TestCase):
+    def test_max_page_bytes(self):
+        self.assertEqual(max_page_bytes(), 664)
+        for bad in (0, 1, 3, 665, 5000):
+            with self.subTest(page_bytes=bad):
+                with self.assertRaises(ValueError):
+                    Server(FakeBackend(), page_bytes=bad)
+        Server(FakeBackend(), page_bytes=664)  # the maximum itself is fine
+
+    def test_cli_rejects_oversized_page_bytes(self):
+        import contextlib, io, server as srv
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+            srv.main(["--model", "m", "--page-bytes", "665"])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("--page-bytes must be 4..664", err.getvalue())
+
+    def test_sweep_every_reply_fits_its_limit(self):
+        # Names from short to the 253-character maximum, every page size up to
+        # the maximum, ASCII and multi-byte content, a long backend error, and
+        # every client buffer: each reply must fit what the client accepts, and
+        # an EDNS client with a 1232+ buffer must never be truncated.
+        contents = [
+            dict(text="x" * 3000),
+            dict(text="\u20ac" * 1000 + "\U0001F999" * 100),
+            dict(text="y" * 50, fail="E" * 1000),
+        ]
+        buffers = [None, 512, 1000, 1232, 4096, 65535]
+        checked = 0
+        for core_len in (7, 64, 128, 200, 240, 247):
+            core = _name_of_len(core_len)
+            for page_bytes in (4, 5, 37, 255, 600, 664):
+                for content in contents:
+                    names = [n for n in [core] + [f"p{n}.{core}" for n in (1, 2, 99999)]
+                             if len(n) <= 253]
+                    server = _done_server(page_bytes=page_bytes, prompt_names=[core], **content)
+                    for name in names:
+                        # A failed generation restarts on every query (by design),
+                        # so the error case runs against two buffers only.
+                        for buf in (buffers if "fail" not in content else [None, 1232]):
+                            with self.subTest(name_len=len(name), page_bytes=page_bytes, buf=buf):
+                                resp = _ask(server, _query(name, buf))
+                                limit = 512 if buf is None else max(512, min(buf, MAX_UDP))
+                                self.assertLessEqual(len(resp), limit)
+                                hdr, qs, answers, _, ropt = parse_message(resp)
+                                self.assertEqual(qs[0]["name"], name)
+                                if hdr["tc"]:
+                                    self.assertEqual(answers, [])
+                                else:
+                                    self.assertEqual(answers[0]["name"], name)  # via the pointer
+                                if buf is not None and buf >= MAX_UDP:
+                                    self.assertFalse(hdr["tc"])
+                                self.assertEqual(ropt is not None, buf is not None)
+                                checked += 1
+        self.assertGreater(checked, 1500)
+
+    def test_paginate_rejects_pages_smaller_than_a_character(self):
+        # Regression: page_bytes=1 with a multi-byte character produced empty
+        # pages forever (an infinite loop in the handler thread).
+        for page_bytes in (0, 1, 2, 3):
+            with self.subTest(page_bytes=page_bytes):
+                with self.assertRaises(ValueError):
+                    _paginate("\u20ac", page_bytes)
+
+    def test_four_byte_pages_hold_any_character(self):
+        text = "a\u00e9\u20ac\U0001F999" * 3  # 1-, 2-, 3- and 4-byte characters
+        pages = _paginate(text, 4)
+        self.assertEqual(b"".join(pages).decode(), text)
+        self.assertTrue(all(0 < len(p) <= 4 for p in pages))
+
+    def test_worst_case_reply_fits_exactly(self):
+        # The longest question name whose next-page hint is still a valid name,
+        # a full maximum-size page, and a [more] hint of 253 characters.
+        core = _name_of_len(250)
+        name = core  # page 0; the hint is "p1." + core = 253 characters
+        server = _done_server(text="z" * 2000, page_bytes=max_page_bytes(), prompt_names=[name])
+        resp = _ask(server, _query(name, 1232))
+        hdr, _, answers, _, _ = parse_message(resp)
+        self.assertFalse(hdr["tc"])
+        self.assertIn(f"[more: dig p1.{core} TXT]", _extract_txt(resp))
+        self.assertLessEqual(len(resp), MAX_UDP)
+        self.assertGreater(len(resp), MAX_UDP - 260)  # the bound is close to tight
+
+    def test_answer_name_is_a_pointer_to_the_question(self):
+        name = _name_of_len(200)
+        server = _done_server(text="hi", prompt_names=[name])
+        resp = _ask(server, _query(name, 1232))
+        answer_at = 12 + len(encode_name(name)) + 4
+        self.assertEqual(resp[answer_at:answer_at + 2], b"\xc0\x0c")
+        # 200-character name: written once, not twice.
+        self.assertEqual(len(resp), 12 + 202 + 4 + 12 + 1 + len("hi [done]") + 11)
+
+    def test_response_opt_is_our_own(self):
+        cookie = struct.pack(">HH", 10, 8) + b"\x01\x02\x03\x04\x05\x06\x07\x08"
+        server = _done_server(text="hi", prompt_names=["c.e.com"])
+        resp = _ask(server, _query("c.e.com", bufsize=4096, do=True, options=cookie))
+        _, _, _, _, ropt = parse_message(resp)
+        self.assertEqual(ropt["class"], 1232)  # our buffer, not the client's 4096
+        self.assertEqual(ropt["ttl"], 0)       # DO clear, version 0, no ext-rcode
+        self.assertEqual(ropt["rdata"], b"")   # no client cookie echoed
+
+    def test_no_opt_in_reply_without_edns(self):
+        resp = _ask(Server(FakeBackend()), _query("e.com"))
+        self.assertIsNone(parse_message(resp)[4])
+
+    def test_opt_on_every_reply_kind(self):
+        server = Server(FakeBackend())
+        for name, qtype in (("notmine.org", TYPE_TXT), ("e.com", TYPE_NS), ("e.com", TYPE_TXT)):
+            with self.subTest(name=name, qtype=qtype):
+                wire = bytearray(_query(name, 1232))
+                wire[12 + len(encode_name(name)):12 + len(encode_name(name)) + 2] = struct.pack(">H", qtype)
+                ropt = parse_message(_ask(server, bytes(wire)))[4]
+                self.assertEqual((ropt["class"], ropt["rdata"]), (1232, b""))
+
+    def test_unknown_edns_version_gets_badvers(self):
+        backend = FakeBackend()
+        resp = _ask(Server(backend), _query("x.e.com", bufsize=1232, version=1))
+        hdr, _, answers, _, ropt = parse_message(resp)
+        self.assertEqual(hdr["rcode"], 0)       # low 4 bits of BADVERS (16)
+        self.assertEqual(ropt["ttl"] >> 24, 1)  # high 8 bits
+        self.assertEqual(answers, [])
+        self.assertEqual(backend.stream_calls, 0)
+
+    def test_classic_client_gets_tc_for_long_answer(self):
+        server = _done_server(text="x" * 600, prompt_names=["long.e.com"])
+        resp = _ask(server, _query("long.e.com"))
+        hdr, _, answers, _, _ = parse_message(resp)
+        self.assertTrue(hdr["tc"])
+        self.assertEqual(answers, [])
+        self.assertLessEqual(len(resp), 512)
+
+    def test_classic_client_gets_short_answer_whole(self):
+        server = _done_server(text="short", prompt_names=["s.e.com"])
+        hdr, _, answers, _, _ = parse_message(_ask(server, _query("s.e.com")))
+        self.assertFalse(hdr["tc"])
+        self.assertEqual(_decode(answers), "short [done]")
+
+    def test_small_edns_buffer_gets_tc(self):
+        server = _done_server(text="x" * 600, prompt_names=["long.e.com"])
+        hdr = parse_message(_ask(server, _query("long.e.com", bufsize=512)))[0]
+        self.assertTrue(hdr["tc"])
+
+    def test_hint_longer_than_a_name_says_so(self):
+        core = _name_of_len(251)  # "p1." + 251 = 254 characters: not a valid name
+        server = _done_server(text="x" * 700, prompt_names=[core])
+        resp = _ask(server, _query(core, 1232))
+        text = _extract_txt(resp)
+        self.assertTrue(text.endswith("[error: prompt too long to page; shorten it]"))
+        self.assertNotIn("[more", text)
+        # A one-page answer for the same name is fine.
+        server = _done_server(text="short", prompt_names=[core])
+        self.assertTrue(_extract_txt(_ask(server, _query(core, 1232))).endswith("short [done]"))
+
+    def test_long_error_reason_truncated(self):
+        server = _done_server(fail="E" * 1000, prompt_names=["err.e.com"])
+        text = _extract_txt(_ask(server, _query("err.e.com", 1232)))
+        self.assertEqual(text, "[error: " + "E" * 200 + "]")
+
+
+def _decode(answers):
+    rdata, out, i = answers[0]["rdata"], [], 0
+    while i < len(rdata):
+        out.append(rdata[i + 1:i + 1 + rdata[i]])
+        i += 1 + rdata[i]
+    return b"".join(out).decode()
 
 
 # --- Real backends against stub HTTP servers (Phase 4) -----------------------
