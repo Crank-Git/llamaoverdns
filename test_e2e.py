@@ -239,6 +239,33 @@ class TestHostilePacketsE2E(unittest.TestCase):
             parse_message(srv.query(build_query("hi.e.com")))
 
 
+class TestZoneApexE2E(unittest.TestCase):
+    """NS/SOA for the apex over a real socket (and dig, if installed)."""
+
+    def test_apex_ns_and_soa_have_no_txt_answer(self):
+        with _ServerProcess(["x"]) as srv:
+            for qtype in (2, 6):  # NS, SOA
+                with self.subTest(qtype=qtype):
+                    header, questions, answers, _, _ = parse_message(
+                        srv.query(build_query("e.com", qtype=qtype)))
+                    self.assertEqual(header["rcode"], 0)
+                    self.assertEqual(questions[0]["qtype"], qtype)
+                    self.assertEqual(answers, [])
+            _, _, answers, _, _ = parse_message(srv.query(build_query("e.com")))
+            self.assertIn("ollama-over-dns", _decode_txt(answers[0]["rdata"]))
+
+    def test_apex_ns_with_dig(self):
+        dig = shutil.which("dig")
+        if not dig:
+            self.skipTest("dig not available")
+        with _ServerProcess(["x"]) as srv:
+            out = subprocess.run([dig, "@127.0.0.1", "-p", str(srv.port), "e.com", "NS"],
+                                 capture_output=True, text=True, timeout=15).stdout
+            self.assertIn("status: NOERROR", out)
+            self.assertIn("ANSWER: 0", out)
+            self.assertNotIn("TXT", out.split("ANSWER: 0", 1)[1])
+
+
 class TestDigE2E(unittest.TestCase):
     """Drive a real server.py subprocess with the real dig client."""
 
