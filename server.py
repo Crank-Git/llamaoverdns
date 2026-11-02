@@ -40,6 +40,21 @@ FLAG_RA = 1 << 7  # recursion available
 # Class IN (internet)
 CLASS_IN = 1
 
+# Largest UDP reply we ever send, and the buffer size we advertise: 1232 bytes
+# avoids IP fragmentation on almost every path (DNS Flag Day 2020). Clients
+# without EDNS get at most 512 (RFC 1035).
+MAX_UDP = 1232
+CLASSIC_UDP = 512
+
+# Longest name allowed in presentation form (without the trailing dot).
+MAX_NAME_TEXT = 253
+
+# The widest UTF-8 character; no page or TXT string can be smaller than this.
+MIN_PAGE_BYTES = 4
+
+# Error reasons from backends can be long (HTTP bodies); keep replies small.
+MAX_ERROR_CHARS = 200
+
 # Opcode 0 is a standard query; everything else (IQUERY, STATUS, NOTIFY,
 # UPDATE, ...) gets NOTIMP.
 OPCODE_QUERY = 0
@@ -282,16 +297,16 @@ def build_answer(name, rtype, rdata, ttl=0, qclass=CLASS_IN):
     return encode_name(name) + struct.pack(">HHIH", rtype, qclass, ttl, len(rdata)) + rdata
 
 
-def build_opt(buffer_size=1232, do=True):
-    """Build an EDNS0 OPT record byte string.
+def build_opt(buffer_size=MAX_UDP, do=False, ext_rcode=0):
+    """Build an EDNS0 OPT record byte string with no options.
 
-    The DO (DNSSEC OK) flag is set when ``do`` is true so resolvers know we
-    accept large responses.
+    ``do`` sets the DNSSEC OK flag. ``ext_rcode`` is the upper 8 bits of a
+    12-bit RCODE (1 = BADVERS).
     """
-    rdata = b"\x00\x00\x00\x00"  # option code 0, option length 0
     flags = 0x8000 if do else 0  # DO bit in the low 16 bits of the TTL field
-    # name=root(0x00), type=41, class=buffer size, ttl=ext-rcode|ver|flags
-    return b"\x00" + struct.pack(">HHIH", TYPE_OPT, buffer_size, flags, len(rdata)) + rdata
+    ttl = (ext_rcode << 24) | flags  # ext-rcode | version 0 | flags
+    # name=root(0x00), type=41, class=buffer size, ttl, rdlength=0
+    return b"\x00" + struct.pack(">HHIH", TYPE_OPT, buffer_size, ttl, 0)
 
 
 def encode_question(q):
@@ -299,12 +314,14 @@ def encode_question(q):
 
 
 def assemble_response(qid, questions, answers, *, opt=None, rcode=RCODE_NOERROR,
-                      aa=True, rd=True, opcode=0):
+                      aa=True, rd=True, opcode=0, tc=False):
     """Assemble a full response message from its parts."""
     flags = (opcode << 11)
     flags |= FLAG_QR
     if aa:
         flags |= FLAG_AA
+    if tc:
+        flags |= FLAG_TC
     if rd:
         flags |= FLAG_RD
     flags |= (rcode & 0xF)
@@ -329,6 +346,10 @@ def _paginate(text, page_bytes):
     page (its leading byte is pulled back into the preceding page rather than
     dropped).
     """
+    if page_bytes < MIN_PAGE_BYTES:
+        # A page must hold the widest UTF-8 character, or a character that
+        # doesn't fit would produce an empty page and never advance.
+        raise ValueError(f"page_bytes must be at least {MIN_PAGE_BYTES}")
     encoded = text.encode("utf-8")
     pages = []
     i = 0
@@ -522,7 +543,14 @@ class GenerationManager:
         # appended (the status tells the client whether to page forward, wait,
         # or that generation finished).
         page_text_str = page_text.decode("utf-8", "replace")
-        more = f"[more: dig p{page + 1}.{page_base} TXT]"
+        next_name = f"p{page + 1}.{page_base}"
+        if len(next_name) <= MAX_NAME_TEXT:
+            more = f"[more: dig {next_name} TXT]"
+        else:
+            # The next page's name would not be a valid DNS name.
+            more = "[error: prompt too long to page; shorten it]"
+        if error:
+            error = error[:MAX_ERROR_CHARS]
         if done:
             if more_after:
                 status = more
@@ -554,12 +582,32 @@ USAGE_STRING = (
 )
 
 
+def max_page_bytes(limit=MAX_UDP):
+    """Largest --page-bytes for which every possible reply fits ``limit``.
+
+    Worst case: a 255-byte question name, the longest status string (a
+    ``[more: ...]`` hint naming a 253-character name), and our OPT record.
+    """
+    fixed = 12 + (255 + 4) + (2 + 10) + 11  # header, question, answer RR, OPT
+    status = len("[more: dig  TXT]") + MAX_NAME_TEXT
+    page = limit
+    while page > 0:
+        text = page + 1 + status  # page, one space, status
+        if fixed + text + -(-text // 255) <= limit:  # + one length byte per string
+            return page
+        page -= 1
+    return 0
+
+
 class Server:
     """Turn parsed DNS questions into responses via the backend."""
 
     def __init__(self, backend, *, zone="e.com", page_bytes=600, wait=3.5,
                  max_gen=2, cache_ttl=600, max_entries=64,
                  system_prompt=SYSTEM_PROMPT, usage_string=USAGE_STRING):
+        if not MIN_PAGE_BYTES <= page_bytes <= max_page_bytes():
+            raise ValueError(f"page_bytes must be {MIN_PAGE_BYTES}..{max_page_bytes()} "
+                             f"so every reply fits {MAX_UDP} bytes")
         self.backend = backend
         self.zone = zone
         self.page_bytes = page_bytes
@@ -569,11 +617,18 @@ class Server:
         self.system_prompt = system_prompt
         self.usage_string = usage_string
 
-    def _txt_response(self, question, qid, opt, text):
-        chunks = split_txt(text)
-        rdata = build_txt_rdata(chunks)
-        ans = build_answer(question["name"], TYPE_TXT, rdata, ttl=0)
-        return assemble_response(qid, [question], [ans], opt=opt, aa=True)
+    def _txt_response(self, question, qid, opt, text, limit):
+        rdata = build_txt_rdata(split_txt(text))
+        # The owner name is a compression pointer to the question's name, which
+        # always starts right after the 12-byte header.
+        ans = b"\xc0\x0c" + struct.pack(">HHIH", TYPE_TXT, CLASS_IN, 0, len(rdata)) + rdata
+        resp = assemble_response(qid, [question], [ans], opt=opt, aa=True)
+        if len(resp) > limit:
+            # Too big for what the client accepts: an empty, truncated reply
+            # (RFC 2181 §9). Only clients without EDNS, or with a buffer under
+            # 1232, can get here; max_page_bytes() guarantees the rest fit.
+            return assemble_response(qid, [question], [], opt=opt, aa=True, tc=True)
+        return resp
 
     def handle(self, header, questions, opt):
         """Handle one parsed message. Returns response bytes, or None to drop."""
@@ -581,7 +636,17 @@ class Server:
             # A response, not a query. Answering it could start a loop with
             # another DNS speaker, so drop it.
             return None
-        opt_bytes = opt_to_bytes(opt)
+        # Our own OPT, never an echo of the client's (its cookie, DO bit and
+        # buffer size are its own); only sent when the query used EDNS.
+        if opt is None:
+            opt_bytes, limit = None, CLASSIC_UDP
+        else:
+            limit = max(CLASSIC_UDP, min(opt["class"], MAX_UDP))
+            if (opt["ttl"] >> 16) & 0xFF != 0:
+                # Only EDNS version 0 exists: BADVERS (RFC 6891 §6.1.3).
+                return assemble_response(header["id"], questions[:1], [],
+                                         opt=build_opt(ext_rcode=1))
+            opt_bytes = build_opt()
         if header["opcode"] != OPCODE_QUERY:
             return assemble_response(header["id"], questions[:1], [], opt=opt_bytes,
                                      rcode=RCODE_NOTIMP, opcode=header["opcode"])
@@ -600,16 +665,16 @@ class Server:
             return assemble_response(header["id"], [q], [], opt=opt_bytes, rcode=RCODE_NOERROR)
         if prompt == "":
             # TXT for the zone itself -> one-line usage string.
-            return self._txt_response(q, header["id"], opt_bytes, self.usage_string)
+            return self._txt_response(q, header["id"], opt_bytes, self.usage_string, limit)
         state, err = self.manager.get_or_start(prompt)
         if err is not None:
-            return self._txt_response(q, header["id"], opt_bytes, f"[error: {err}]")
+            return self._txt_response(q, header["id"], opt_bytes, f"[error: {err}]", limit)
         # Page forward from the core name (page prefix + zone already stripped) so
         # paging chains through the same cached generation.
         core = core_name(q["name"], self.zone)
         page_base = f"{core}.{self.zone}" if core else self.zone
         reply = self.manager.fetch_page(state, page, self.page_bytes, self.wait, page_base)
-        return self._txt_response(q, header["id"], opt_bytes, reply)
+        return self._txt_response(q, header["id"], opt_bytes, reply, limit)
 
 
 # At most this many packets are handled at once. Each handler can block for up
@@ -672,14 +737,6 @@ def run_udp_server(server, host, port):
     # Flushed so the line shows up immediately when stdout is a pipe or a log.
     print(f"ollama-over-dns listening on udp {host}:{port} (zone {server.zone})", flush=True)
     serve(sock, server)
-
-
-def opt_to_bytes(opt):
-    """Rebuild the raw bytes of an EDNS0 OPT record for echoing back."""
-    if opt is None:
-        return None
-    return b"\x00" + struct.pack(">HHIH", opt["type"], opt["class"],
-                                 opt["ttl"], len(opt["rdata"])) + opt["rdata"]
 
 
 # --- Backends (Phase 4) ------------------------------------------------------
@@ -859,6 +916,9 @@ def main(argv=None):
     p.add_argument("--page-bytes", type=int, default=600)
     p.add_argument("--max-gen", type=int, default=2)
     args = p.parse_args(argv)
+    if not MIN_PAGE_BYTES <= args.page_bytes <= max_page_bytes():
+        p.error(f"--page-bytes must be {MIN_PAGE_BYTES}..{max_page_bytes()} so every reply fits "
+                f"{MAX_UDP} bytes")
 
     backend = make_backend(args)
     server = Server(backend, zone=args.zone, page_bytes=args.page_bytes,
