@@ -4,7 +4,7 @@ A small, fun, intentionally dumb DNS server that answers `TXT` queries with
 LLM output. There is **no client** — `dig` is the client.
 
 ```console
-$ dig @127.0.0.1 -p 5353 what.does.bravurva.mean.e.com TXT
+$ dig @127.0.0.1 -p 5300 what.does.bravurva.mean.e.com TXT
 ;; ANSWER SECTION:
 what.does.bravurva.mean.e.com. 0 IN TXT "bravurva isn't a real word..." "[more: dig p1.what.does.bravurva.mean.e.com TXT]"
 ```
@@ -41,7 +41,7 @@ ollama pull llama3.2
 python3 server.py --backend ollama --model llama3.2
 
 # 3. Query it.
-dig @127.0.0.1 -p 5353 what.does.bravurva.mean.e.com TXT
+dig @127.0.0.1 -p 5300 what.does.bravurva.mean.e.com TXT
 ```
 
 ### llamacpp (`llama-server`)
@@ -55,15 +55,15 @@ llama-server -m path/to/model.gguf --port 8080
 python3 server.py --backend llamacpp
 
 # 3. Query it.
-dig @127.0.0.1 -p 5353 what.does.bravurva.mean.e.com TXT
+dig @127.0.0.1 -p 5300 what.does.bravurva.mean.e.com TXT
 ```
 
 ## Flags
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--host` | `0.0.0.0` | UDP interface to bind |
-| `--port` | `5353` | UDP port. Use `--port 53` when run as root (or with `cap_net_bind_service`) |
+| `--host` | `127.0.0.1` | UDP interface to bind. `0.0.0.0` exposes the model to every host that can reach this one |
+| `--port` | `5300` | UDP port. Not 5353, which is mDNS. Use `--port 53` when run as root (or with `cap_net_bind_service`) |
 | `--zone` | `e.com` | Suffix stripped to form the prompt. Names not under it → `REFUSED` |
 | `--backend` | `ollama` | `ollama` or `llamacpp` |
 | `--url` | ollama: `$OLLAMA_HOST` or `http://localhost:11434` · llamacpp: `http://localhost:8080` | Backend HTTP URL |
@@ -78,20 +78,20 @@ dig @127.0.0.1 -p 5353 what.does.bravurva.mean.e.com TXT
 1. Basic — the labels before `.e.com` are the prompt:
 
    ```bash
-   dig @127.0.0.1 -p 5353 what.does.bravurva.mean.e.com TXT
+   dig @127.0.0.1 -p 5300 what.does.bravurva.mean.e.com TXT
    ```
 
 2. Paging — a leading `p1.` fetches page 1 of the same generation. Follow the
    `[more: …]` hint until you see `[done]`:
 
    ```bash
-   dig @127.0.0.1 -p 5353 p1.what.does.bravurva.mean.e.com TXT
+   dig @127.0.0.1 -p 5300 p1.what.does.bravurva.mean.e.com TXT
    ```
 
 3. Phrases and hyphens — a `-` inside a label is treated as a space:
 
    ```bash
-   dig @127.0.0.1 -p 5353 why-is-the-sky-blue.e.com TXT
+   dig @127.0.0.1 -p 5300 why-is-the-sky-blue.e.com TXT
    ```
 
 > `dig +short` prints each 255-byte chunk as a separate quoted string, so long
@@ -124,7 +124,7 @@ automates the paging loop — it fetches page 0, follows the hint until `[done]`
 and prints the assembled answer:
 
 ```bash
-python3 client.py --host 127.0.0.1 --port 5353 --prompt "what does bruturva mean"
+python3 client.py --host 127.0.0.1 --port 5300 --prompt "what does bruturva mean"
 ```
 
 Spaces in `--prompt` become labels (hyphens are preserved, since the server

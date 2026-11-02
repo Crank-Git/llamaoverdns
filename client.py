@@ -54,7 +54,7 @@ def main(argv=None):
     p = argparse.ArgumentParser(description="Page through an ollama-over-dns answer.")
     p.add_argument("--prompt", required=True, help="the prompt (spaces are fine)")
     p.add_argument("--host", default="127.0.0.1")
-    p.add_argument("--port", type=int, default=5353)
+    p.add_argument("--port", type=int, default=5300)
     p.add_argument("--zone", default="e.com")
     p.add_argument("--max-pages", type=int, default=100,
                    help="safety cap on pages fetched (default 100)")

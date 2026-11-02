@@ -22,6 +22,7 @@ from server import (
     query_to_prompt, split_txt, strip_thinking, _paginate,
     Server, GenerationManager, OllamaBackend, LlamaCppBackend,
     SYSTEM_PROMPT, normalize_url, make_backend, max_page_bytes, MAX_UDP,
+    make_usage_string,
     TYPE_A, TYPE_NS, TYPE_SOA, TYPE_AAAA, TYPE_MX, TYPE_CNAME, DNSError,
 )
 
@@ -1080,6 +1081,47 @@ def _decode(answers):
         out.append(rdata[i + 1:i + 1 + rdata[i]])
         i += 1 + rdata[i]
     return b"".join(out).decode()
+
+
+# --- CLI defaults and the usage string ---------------------------------------
+class Defaults(unittest.TestCase):
+    def _main(self, argv):
+        """Run server.main without binding; return (server, host, port)."""
+        from unittest import mock
+        import server as srv
+        with mock.patch.object(srv, "run_udp_server") as run:
+            srv.main(argv)
+        return run.call_args.args
+
+    def test_default_bind_is_loopback_on_5300(self):
+        server, host, port = self._main(["--model", "m"])
+        self.assertEqual((host, port), ("127.0.0.1", 5300))
+        self.assertEqual(server.usage_string, make_usage_string("e.com", "127.0.0.1", 5300))
+        self.assertIn("dig @127.0.0.1 -p 5300 +short <prompt>.e.com TXT", server.usage_string)
+
+    def test_usage_string_follows_zone_host_and_port(self):
+        server, host, port = self._main(["--model", "m", "--zone", "llm.example.org",
+                                         "--host", "0.0.0.0", "--port", "53"])
+        self.assertEqual(server.usage_string,
+                         "ollama-over-dns: dig @<server> +short <prompt>.llm.example.org TXT; "
+                         "labels before .llm.example.org are the prompt; prefix p<N>. "
+                         "(e.g. p1.) to page.")
+        self.assertNotIn("e.com ", server.usage_string)
+
+    def test_server_default_usage_string_uses_its_zone(self):
+        header, q = _make_question("x.test")
+        text = _extract_txt(Server(FakeBackend(), zone="x.test").handle(header, [q], None))
+        self.assertIn("<prompt>.x.test TXT", text)
+        self.assertIn("-p 5300", text)
+
+    def test_usage_reply_fits_for_a_long_zone(self):
+        zone = _name_of_len(240, zone="example.org")
+        header, q = _make_question(zone)
+        resp = Server(FakeBackend(), zone=zone).handle(header, [q], EDNS_1232)
+        hdr, _, answers, _, _ = parse_message(resp)
+        self.assertFalse(hdr["tc"])
+        self.assertLessEqual(len(resp), MAX_UDP)
+        self.assertIn(zone, _decode(answers))
 
 
 # --- Real backends against stub HTTP servers (Phase 4) -----------------------
