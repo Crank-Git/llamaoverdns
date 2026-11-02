@@ -15,7 +15,7 @@ import time
 import client  # noqa: E402  (pure-logic tests below, no dig needed)
 
 from server import (
-    TYPE_OPT, TYPE_TXT, CLASS_IN, RCODE_NOERROR, RCODE_REFUSED,
+    TYPE_OPT, TYPE_TXT, CLASS_IN, RCODE_NOERROR, RCODE_REFUSED, RCODE_NOTIMP,
     FLAG_QR, FLAG_AA, FLAG_RD,
     decode_name, encode_name, parse_header, parse_message,
     build_query, build_txt_rdata, build_answer, build_opt, assemble_response,
@@ -84,6 +84,140 @@ class TruncatedMessages(unittest.TestCase):
         msg = struct.pack(">HHHHHH", 1, FLAG_QR, 0, 1, 0, 0) + partial
         with self.assertRaises(DNSError):
             parse_message(msg)
+
+
+def _header(qdcount=1, flags=0, qid=1):
+    return struct.pack(">HHHHHH", qid, flags, qdcount, 0, 0, 0)
+
+
+class ParserHardening(unittest.TestCase):
+    """Malformed names must raise DNSError quickly, never hang or crash."""
+
+    def assertRejectedFast(self, msg):
+        start = time.monotonic()
+        with self.assertRaises(DNSError):
+            parse_message(msg)
+        self.assertLess(time.monotonic() - start, 0.1)
+
+    def test_self_pointer_loop_rejected(self):
+        # The name at offset 12 is a pointer to offset 12.
+        self.assertRejectedFast(_header() + b"\xc0\x0c" + b"\x00\x10\x00\x01")
+
+    def test_two_hop_pointer_loop_rejected(self):
+        # offset 12 -> pointer to 14, offset 14 -> pointer to 12.
+        self.assertRejectedFast(_header() + b"\xc0\x0e\xc0\x0c" + b"\x00\x10\x00\x01")
+
+    def test_label_then_pointer_back_to_itself_rejected(self):
+        # "a" then a pointer back to the start of "a": an infinite "a.a.a...".
+        self.assertRejectedFast(_header() + b"\x01a\xc0\x0c" + b"\x00\x10\x00\x01")
+
+    def test_forward_pointer_chain_still_decodes(self):
+        # Legitimate (if unusual) chain of pointers ending in a real name.
+        body = _header() + b"\xc0\x0e" + b"\xc0\x10" + b"\x01x\x00" + b"\x00\x10\x00\x01"
+        _, questions, _, _, _ = parse_message(body)
+        self.assertEqual(questions[0]["name"], "x")
+
+    def test_name_over_255_bytes_rejected(self):
+        name = b"".join(b"\x3f" + b"a" * 63 for _ in range(4)) + b"\x00"  # 257 bytes
+        self.assertRejectedFast(_header() + name + b"\x00\x10\x00\x01")
+
+    def test_name_of_exactly_255_bytes_accepted(self):
+        # 3 x (1+63) + (1+61) + root = 255
+        name = b"".join(b"\x3f" + b"a" * 63 for _ in range(3)) + b"\x3d" + b"b" * 61 + b"\x00"
+        self.assertEqual(len(name), 255)
+        _, questions, _, _, _ = parse_message(_header() + name + b"\x00\x10\x00\x01")
+        self.assertEqual(len(encode_name(questions[0]["name"])), 255)
+
+    def test_reserved_label_types_rejected(self):
+        for prefix in (0x40, 0x80):
+            with self.subTest(prefix=hex(prefix)):
+                # Enough bytes follow that, read as a plain length (65 or
+                # 129), the label would fit, so only the type check rejects it.
+                length = prefix | 1
+                self.assertRejectedFast(_header() + bytes([length]) + b"a" * length
+                                        + b"\x00\x00\x10\x00\x01")
+
+    def test_label_past_end_rejected(self):
+        self.assertRejectedFast(_header() + b"\x05ab")
+
+    def test_unrepresentable_label_bytes_rejected(self):
+        # A '.' inside a label, a control byte, and a non-ASCII byte would all
+        # change the name when it is echoed back, so they are refused.
+        for bad in (b"a.b", b"a\x00b", b"a\xffb"):
+            with self.subTest(label=bad):
+                self.assertRejectedFast(_header() + bytes([len(bad)]) + bad + b"\x00\x00\x10\x00\x01")
+
+    def test_space_in_label_accepted(self):
+        # dig 'what\032is.e.com' sends a space inside one label.
+        _, questions, _, _, _ = parse_message(_header() + b"\x07what is\x01e\x03com\x00\x00\x10\x00\x01")
+        self.assertEqual(query_to_prompt(questions[0]["name"], "e.com"), ("what is", 0))
+
+    def test_fuzz_never_hangs_or_raises_unexpected(self):
+        # Seeded so a failure is reproducible. Mutates real queries (bit flips,
+        # truncation, splices) and mixes in pure noise; every packet must either
+        # parse and be handled, or raise DNSError, within a few milliseconds.
+        import random
+        rng = random.Random(1234)
+        server = Server(FakeBackend(), wait=0, max_gen=10_000)
+        seeds = [
+            build_query("what.does.bravurva.mean.e.com"),
+            build_query("p3.foo.e.com"),
+            build_query("e.com", qtype=TYPE_A),
+            build_query("notmine.org"),
+        ]
+        handled = rejected = 0
+        for i in range(5000):
+            kind = i % 4
+            if kind == 0:
+                pkt = bytes(rng.getrandbits(8) for _ in range(rng.randrange(0, 80)))
+            else:
+                pkt = bytearray(rng.choice(seeds))
+                for _ in range(rng.randrange(1, 6)):
+                    pkt[rng.randrange(len(pkt))] = rng.getrandbits(8)
+                if kind == 2:
+                    pkt = pkt[:rng.randrange(len(pkt) + 1)]
+                if kind == 3:
+                    pkt += bytes(rng.getrandbits(8) for _ in range(rng.randrange(1, 20)))
+                pkt = bytes(pkt)
+            start = time.monotonic()
+            try:
+                header, questions, _, _, opt = parse_message(pkt)
+            except DNSError:
+                rejected += 1
+            else:
+                resp = server.handle(header, questions, opt)
+                if resp is not None:
+                    parse_message(resp)  # whatever we send back must itself parse
+                handled += 1
+            self.assertLess(time.monotonic() - start, 0.05, f"packet {i}: {pkt.hex()}")
+        # Both paths were actually exercised.
+        self.assertGreater(handled, 100)
+        self.assertGreater(rejected, 100)
+
+
+class QueryKinds(unittest.TestCase):
+    """Only standard queries are answered."""
+
+    def test_response_packets_dropped(self):
+        msg = bytearray(build_query("hi.e.com"))
+        msg[2] |= 0x80  # QR=1
+        header, questions, _, _, opt = parse_message(bytes(msg))
+        self.assertIsNone(Server(FakeBackend()).handle(header, questions, opt))
+
+    def test_non_query_opcode_notimp(self):
+        for opcode in (1, 2, 4, 5):  # IQUERY, STATUS, NOTIFY, UPDATE
+            with self.subTest(opcode=opcode):
+                msg = bytearray(build_query("hi.e.com"))
+                msg[2] = (msg[2] & 0x87) | (opcode << 3)
+                header, questions, _, _, opt = parse_message(bytes(msg))
+                backend = FakeBackend()
+                resp = Server(backend).handle(header, questions, opt)
+                rhdr, _, answers, _, _ = parse_message(resp)
+                self.assertEqual(rhdr["rcode"], RCODE_NOTIMP)
+                self.assertEqual(rhdr["opcode"], opcode)
+                self.assertTrue(rhdr["qr"])
+                self.assertEqual(answers, [])
+                self.assertEqual(backend.stream_calls, 0)
 
 
 class QueryToPrompt(unittest.TestCase):

@@ -40,6 +40,15 @@ FLAG_RA = 1 << 7  # recursion available
 # Class IN (internet)
 CLASS_IN = 1
 
+# Opcode 0 is a standard query; everything else (IQUERY, STATUS, NOTIFY,
+# UPDATE, ...) gets NOTIMP.
+OPCODE_QUERY = 0
+
+# A name is at most 255 bytes on the wire (RFC 1035 §2.3.4), so it has at most
+# 127 labels. More pointer hops than that can only be a loop.
+_MAX_NAME_WIRE = 255
+_MAX_POINTER_HOPS = 127
+
 
 class DNSError(ValueError):
     """Raised for malformed or truncated DNS messages."""
@@ -57,6 +66,8 @@ def decode_name(data, offset):
     pos = offset
     jumped = False
     end = None
+    hops = 0
+    wire_len = 1  # the terminating root byte
     while True:
         if pos >= len(data):
             raise DNSError("name ran past end of message")
@@ -65,25 +76,36 @@ def decode_name(data, offset):
             # Compression pointer: 2 bytes, low 14 bits are an offset.
             if pos + 1 >= len(data):
                 raise DNSError("truncated compression pointer")
+            hops += 1
+            if hops > _MAX_POINTER_HOPS:
+                raise DNSError("compression pointer loop")
             pointer = ((length & 0x3F) << 8) | data[pos + 1]
             if not jumped:
                 # First pointer seen: remember where to resume after following it.
                 jumped = True
                 end = pos + 2
-                pos = pointer
-            else:
-                pos = pointer
+            pos = pointer
             continue
+        if length & 0xC0:
+            raise DNSError("reserved label type")
         # Normal label. A zero-length label is the root and terminates the name.
         if length == 0:
             if not jumped:
                 end = pos + 1
             break
-        labels.append(data[pos + 1:pos + 1 + length])
+        if pos + 1 + length > len(data):
+            raise DNSError("label ran past end of message")
+        label = data[pos + 1:pos + 1 + length]
+        if any(b < 0x20 or b > 0x7E or b == 0x2E for b in label):
+            raise DNSError("label has a non-printable, non-ASCII or '.' byte")
+        wire_len += length + 1
+        if wire_len > _MAX_NAME_WIRE:
+            raise DNSError("name longer than 255 bytes")
+        labels.append(label)
         pos += length + 1
     # ``end`` is set on every normal exit above (root label, or the pointer we
     # jumped from); nothing to fix up here.
-    name = ".".join(l.decode("ascii", "replace") for l in labels)
+    name = ".".join(l.decode("ascii") for l in labels)
     return name, end
 
 
@@ -517,7 +539,14 @@ class Server:
 
     def handle(self, header, questions, opt):
         """Handle one parsed message. Returns response bytes, or None to drop."""
+        if header["qr"]:
+            # A response, not a query. Answering it could start a loop with
+            # another DNS speaker, so drop it.
+            return None
         opt_bytes = opt_to_bytes(opt)
+        if header["opcode"] != OPCODE_QUERY:
+            return assemble_response(header["id"], questions[:1], [], opt=opt_bytes,
+                                     rcode=RCODE_NOTIMP, opcode=header["opcode"])
         if not questions:
             return None
         q = questions[0]
@@ -547,7 +576,8 @@ def run_udp_server(server, host, port):
     """Serve DNS over UDP. Malformed packets are logged and dropped."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((host, port))
-    print(f"ollama-over-dns listening on udp {host}:{port} (zone {server.zone})")
+    # Flushed so the line shows up immediately when stdout is a pipe or a log.
+    print(f"ollama-over-dns listening on udp {host}:{port} (zone {server.zone})", flush=True)
     while True:
         data, addr = sock.recvfrom(2048)
         try:
