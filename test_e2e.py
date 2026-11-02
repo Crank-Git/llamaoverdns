@@ -15,6 +15,7 @@ import http.server
 import json
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -158,6 +159,84 @@ class TestSocketE2E(unittest.TestCase):
         _, _, a1, _, _ = parse_message(responses[1])
         t1 = _decode_txt(a1[0]["rdata"])
         self.assertIn("[done]", t1)
+
+
+class _ServerProcess:
+    """A real ``server.py`` subprocess pointed at a stub ollama over HTTP."""
+
+    def __init__(self, chunks, *extra_args):
+        self.chunks = chunks
+        self.extra_args = list(extra_args)
+
+    def __enter__(self):
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _make_stub(self.chunks))
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.port = _free_port()
+        self.proc = subprocess.Popen(
+            [sys.executable, "-u", "server.py", "--backend", "ollama",
+             "--url", f"http://127.0.0.1:{self.httpd.server_address[1]}",
+             "--model", "test", "--host", "127.0.0.1", "--port", str(self.port)]
+            + self.extra_args,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        # Wait for the "listening" line rather than sleeping a fixed time, but
+        # never block forever if the server dies or never prints it.
+        lines = []
+        reader = threading.Thread(target=lambda: lines.append(self.proc.stdout.readline()),
+                                  daemon=True)
+        reader.start()
+        reader.join(timeout=10)
+        line = lines[0] if lines else ""
+        if "listening" not in line:
+            self.__exit__(None, None, None)
+            raise RuntimeError(f"server.py did not start: {line!r}")
+        return self
+
+    def query(self, packet, timeout=5):
+        """Send raw bytes, return the raw reply (or raise socket.timeout)."""
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.settimeout(timeout)
+            s.sendto(packet, ("127.0.0.1", self.port))
+            data, _ = s.recvfrom(65535)
+            return data
+        finally:
+            s.close()
+
+    def __exit__(self, *exc):
+        self.proc.terminate()
+        try:
+            self.output = self.proc.communicate(timeout=5)[0]
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.output = self.proc.communicate()[0]
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+class TestHostilePacketsE2E(unittest.TestCase):
+    """A real server.py must survive malformed packets and keep answering."""
+
+    def test_pointer_loop_packet_does_not_stop_the_server(self):
+        loop = struct.pack(">HHHHHH", 1, 0, 1, 0, 0, 0) + b"\xc0\x0c" + b"\x00\x10\x00\x01"
+        with _ServerProcess(["still here"]) as srv:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.sendto(loop, ("127.0.0.1", srv.port))
+            s.close()
+            reply = srv.query(build_query("alive.e.com"))
+            _, _, answers, _, _ = parse_message(reply)
+            self.assertIn("still here", _decode_txt(answers[0]["rdata"]))
+        self.assertIn("dropping malformed packet", srv.output)
+        self.assertIn("compression pointer loop", srv.output)
+
+    def test_response_packet_gets_no_reply(self):
+        pkt = bytearray(build_query("hi.e.com"))
+        pkt[2] |= 0x80  # QR=1
+        with _ServerProcess(["x"]) as srv:
+            with self.assertRaises(socket.timeout):
+                srv.query(bytes(pkt), timeout=1)
+            # ...and a normal query right after is still answered.
+            parse_message(srv.query(build_query("hi.e.com")))
 
 
 class TestDigE2E(unittest.TestCase):
