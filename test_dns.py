@@ -21,7 +21,7 @@ from server import (
     build_query, build_txt_rdata, build_answer, build_opt, assemble_response,
     query_to_prompt, opt_to_bytes, split_txt, strip_thinking, _paginate,
     Server, GenerationManager, OllamaBackend, LlamaCppBackend,
-    TYPE_A, DNSError,
+    TYPE_A, TYPE_NS, TYPE_SOA, TYPE_AAAA, TYPE_MX, TYPE_CNAME, DNSError,
 )
 
 
@@ -47,6 +47,16 @@ class NameDecoding(unittest.TestCase):
             decoded, end = decode_name(wire, 0)
             self.assertEqual(decoded, name)
             self.assertEqual(end, len(wire))
+
+    def test_trailing_dot_encodes_like_bare_name(self):
+        for name in ("e.com", "a.b.c", "x"):
+            with self.subTest(name=name):
+                self.assertEqual(encode_name(name + "."), encode_name(name))
+        self.assertEqual(encode_name("."), b"\x00")
+
+    def test_empty_inner_label_rejected(self):
+        with self.assertRaises(DNSError):
+            encode_name("a..b")
 
     def test_decode_compressed_name(self):
         # "www" is read first, then a pointer jumps back to "example.com" which
@@ -382,6 +392,38 @@ class ServerTests(unittest.TestCase):
         rhdr, _, answers, _, _ = parse_message(resp)
         self.assertEqual(rhdr["rcode"], RCODE_NOERROR)
         self.assertEqual(answers, [])
+
+    def test_apex_non_txt_empty_noerror(self):
+        # NS/SOA/etc. for the apex (or the apex with a page prefix) must never
+        # get the TXT usage string back.
+        for name in ("e.com", "E.COM.", "p0.e.com", "p7.e.com"):
+            for qtype in (TYPE_NS, TYPE_SOA, TYPE_A, TYPE_AAAA, TYPE_MX, TYPE_CNAME, 255):
+                with self.subTest(name=name, qtype=qtype):
+                    backend = FakeBackend()
+                    header, q = _make_question(name, qtype=qtype)
+                    resp = Server(backend).handle(header, [q], None)
+                    rhdr, rq, answers, _, _ = parse_message(resp)
+                    self.assertEqual(rhdr["rcode"], RCODE_NOERROR)
+                    self.assertTrue(rhdr["aa"])
+                    self.assertEqual(answers, [])
+                    self.assertEqual(rq[0]["qtype"], qtype)  # question echoed as asked
+                    self.assertEqual(backend.stream_calls, 0)
+
+    def test_apex_txt_still_returns_usage(self):
+        for name in ("e.com", "p0.e.com"):
+            with self.subTest(name=name):
+                header, q = _make_question(name)
+                _, _, answers, _, _ = parse_message(Server(FakeBackend()).handle(header, [q], None))
+                self.assertEqual(answers[0]["type"], TYPE_TXT)
+                self.assertIn("ollama-over-dns", _extract_txt(Server(FakeBackend()).handle(header, [q], None)))
+
+    def test_non_txt_below_apex_never_starts_generation(self):
+        backend = FakeBackend({"foo": ["bar"]})
+        server = Server(backend)
+        for qtype in (TYPE_NS, TYPE_SOA, TYPE_A, TYPE_AAAA):
+            header, q = _make_question("foo.e.com", qtype=qtype)
+            server.handle(header, [q], None)
+        self.assertEqual(backend.stream_calls, 0)
 
     def test_pagination_exact_multiples(self):
         backend = FakeBackend({"multi": ["a" * 600, "b" * 600]})

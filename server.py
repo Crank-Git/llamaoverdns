@@ -113,11 +113,15 @@ def encode_name(name):
     """Encode a dotted name into wire format (no compression)."""
     if isinstance(name, str):
         name = name.encode("ascii")
+    if name.endswith(b"."):
+        name = name[:-1]  # a fully-qualified "e.com." is the same name as "e.com"
     if name == b"":
         return b"\x00"  # root name
     out = b""
     for label in name.split(b".") if isinstance(name, bytes) else name.split("."):
         label = label.encode("ascii") if isinstance(label, str) else label
+        if not label:
+            raise DNSError("empty label")  # a zero byte here would end the name early
         if len(label) > 63:
             raise DNSError("label too long (>63 bytes)")
         out += bytes([len(label)]) + label
@@ -555,12 +559,14 @@ class Server:
             # Not under our zone -> REFUSED.
             return assemble_response(header["id"], [q], [], opt=opt_bytes, rcode=RCODE_REFUSED)
         prompt, page = result
-        if prompt == "":
-            # The zone itself -> one-line usage string.
-            return self._txt_response(q, header["id"], opt_bytes, self.usage_string)
         if q["qtype"] != TYPE_TXT:
-            # Some other record type in our zone -> empty NOERROR.
+            # Any other record type in our zone, the apex included -> empty
+            # NOERROR. This check comes first so an NS/SOA question for the
+            # apex never gets a TXT answer.
             return assemble_response(header["id"], [q], [], opt=opt_bytes, rcode=RCODE_NOERROR)
+        if prompt == "":
+            # TXT for the zone itself -> one-line usage string.
+            return self._txt_response(q, header["id"], opt_bytes, self.usage_string)
         state, err = self.manager.get_or_start(prompt)
         if err is not None:
             return self._txt_response(q, header["id"], opt_bytes, f"[error: {err}]")
