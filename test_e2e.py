@@ -28,7 +28,7 @@ import warnings
 warnings.filterwarnings("ignore", category=ResourceWarning)
 
 from server import (build_query, build_opt, parse_message, TYPE_TXT,
-                    OllamaBackend, Server)
+                    OllamaBackend, Server, serve)
 
 
 def _decode_txt(rdata):
@@ -51,8 +51,12 @@ def _free_port():
     return port
 
 
-def _make_stub(chunks):
-    """Build a stub /api/chat handler that yields ``chunks`` as NDJSON."""
+def _make_stub(chunks, delay=0.0):
+    """Build a stub /api/chat handler that yields ``chunks`` as NDJSON.
+
+    With ``delay``, each chunk is written and flushed ``delay`` seconds apart,
+    like a model generating in real time.
+    """
 
     class Stub(http.server.BaseHTTPRequestHandler):
         def do_POST(self):
@@ -70,7 +74,11 @@ def _make_stub(chunks):
             self.send_header("Content-Type", "application/x-ndjson")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            for line in lines:
+                if delay:
+                    time.sleep(delay)
+                self.wfile.write(line)
+                self.wfile.flush()
             self.close_connection = True  # don't hold the connection open
 
         def log_message(self, *args):
@@ -164,12 +172,14 @@ class TestSocketE2E(unittest.TestCase):
 class _ServerProcess:
     """A real ``server.py`` subprocess pointed at a stub ollama over HTTP."""
 
-    def __init__(self, chunks, *extra_args):
+    def __init__(self, chunks, *extra_args, delay=0.0):
         self.chunks = chunks
         self.extra_args = list(extra_args)
+        self.delay = delay
 
     def __enter__(self):
-        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _make_stub(self.chunks))
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0),
+                                                     _make_stub(self.chunks, self.delay))
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
         self.port = _free_port()
         self.proc = subprocess.Popen(
@@ -264,6 +274,168 @@ class TestZoneApexE2E(unittest.TestCase):
             self.assertIn("status: NOERROR", out)
             self.assertIn("ANSWER: 0", out)
             self.assertNotIn("TXT", out.split("ANSWER: 0", 1)[1])
+
+
+class _Held:
+    """Backend that yields ``text`` and then holds the generation open until
+    ``release`` is set, so a query for it waits the server's full ``--wait``."""
+
+    def __init__(self, text="partial"):
+        self.text = text
+        self.release = threading.Event()
+
+    def stream(self, prompt):
+        yield self.text
+        self.release.wait(10)
+
+
+class _Serving:
+    """Run ``serve()`` on a real UDP socket in a background thread."""
+
+    def __init__(self, server, **kw):
+        self.server, self.kw = server, kw
+
+    def __enter__(self):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind(("127.0.0.1", 0))
+        self.addr = self.sock.getsockname()
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=serve, args=(self.sock, self.server),
+                                       kwargs=dict(stop=self.stop, **self.kw), daemon=True)
+        self.thread.start()
+        return self
+
+    def ask(self, qname, results, key=None, timeout=5):
+        """Query ``qname``; store (seconds, text-or-None) in ``results[key]``."""
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(timeout)
+        start = time.monotonic()
+        try:
+            s.sendto(build_query(qname), self.addr)
+            data, _ = s.recvfrom(65535)
+            _, _, answers, _, _ = parse_message(data)
+            text = _decode_txt(answers[0]["rdata"]) if answers else ""
+        except socket.timeout:
+            text = None
+        finally:
+            s.close()
+        results[key or qname] = (time.monotonic() - start, text)
+
+    def ask_all(self, qnames, timeout=5):
+        results = {}
+        threads = [threading.Thread(target=self.ask, args=(q, results, q, timeout))
+                   for q in qnames]
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+        return results
+
+    def __exit__(self, *exc):
+        self.stop.set()
+        self.thread.join(timeout=2)
+        self.sock.close()
+
+
+class TestConcurrentServing(unittest.TestCase):
+    """serve() handles each packet on its own thread."""
+
+    def test_simultaneous_slow_queries_all_answer_within_one_wait(self):
+        backend = _Held()
+        server = Server(backend, wait=1.0, max_gen=8)
+        names = [f"q{i}.e.com" for i in range(8)]
+        with _Serving(server) as srv:
+            start = time.monotonic()
+            results = srv.ask_all(names)
+            elapsed = time.monotonic() - start
+        backend.release.set()
+        for name in names:
+            seconds, text = results[name]
+            self.assertEqual(text, "partial [thinking... repeat the same query]", name)
+            self.assertGreaterEqual(seconds, 0.9)  # each one really waited...
+        self.assertLess(elapsed, 2.0)  # ...but in parallel (serial would be 8 s)
+
+    def test_fast_query_not_delayed_by_a_waiting_one(self):
+        backend = _Held()
+        with _Serving(Server(backend, wait=2.0)) as srv:
+            results = {}
+            slow = threading.Thread(target=srv.ask, args=("slow.e.com", results))
+            slow.start()
+            time.sleep(0.2)  # the slow query is now waiting inside handle()
+            srv.ask("e.com", results)  # apex usage string: no generation
+            slow.join()
+        backend.release.set()
+        self.assertLess(results["e.com"][0], 0.5)
+        self.assertIn("ollama-over-dns", results["e.com"][1])
+        self.assertGreaterEqual(results["slow.e.com"][0], 1.9)
+
+    def test_malformed_packet_does_not_delay_valid_one(self):
+        with _Serving(Server(_Held(), wait=0)) as srv:
+            junk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            for pkt in (b"", b"\x00", struct.pack(">HHHHHH", 1, 0, 1, 0, 0, 0) + b"\xc0\x0c\x00\x10\x00\x01"):
+                junk.sendto(pkt, srv.addr)
+            junk.close()
+            results = {}
+            srv.ask("e.com", results)
+        self.assertLess(results["e.com"][0], 0.5)
+        self.assertIn("ollama-over-dns", results["e.com"][1])
+
+    def test_inflight_cap_drops_excess_then_recovers(self):
+        backend = _Held()
+        with _Serving(Server(backend, wait=1.0, max_gen=8), max_inflight=2) as srv:
+            results = {}
+            threads = [threading.Thread(target=srv.ask, args=(f"c{i}.e.com", results, None, 2))
+                       for i in range(3)]
+            for t in threads:
+                t.start()
+                time.sleep(0.05)  # arrive in order: c0, c1, then c2 over the cap
+            [t.join() for t in threads]
+            answered = sorted(k for k, (_, text) in results.items() if text is not None)
+            self.assertEqual(answered, ["c0.e.com", "c1.e.com"])
+            self.assertIsNone(results["c2.e.com"][1])
+            # Both slots were released: a new query is answered.
+            later = {}
+            srv.ask("e.com", later)
+            self.assertIsNotNone(later["e.com"][1])
+        backend.release.set()
+
+    def test_handler_exception_releases_its_slot(self):
+        class Exploding(Server):
+            def handle(self, header, questions, opt):
+                if questions and questions[0]["name"].startswith("boom"):
+                    raise RuntimeError("kaboom")
+                return super().handle(header, questions, opt)
+
+        with _Serving(Exploding(_Held(), wait=0), max_inflight=1) as srv:
+            results = {}
+            for i in range(3):
+                srv.ask(f"boom{i}.e.com", results, timeout=0.5)  # no reply, slot freed
+            srv.ask("e.com", results)
+        self.assertIsNone(results["boom0.e.com"][1])
+        self.assertIn("ollama-over-dns", results["e.com"][1])
+
+    def test_stop_returns_promptly(self):
+        srv = _Serving(Server(_Held())).__enter__()
+        start = time.monotonic()
+        srv.__exit__(None, None, None)
+        self.assertFalse(srv.thread.is_alive())
+        self.assertLess(time.monotonic() - start, 1.0)
+
+    def test_concurrent_queries_against_server_process(self):
+        # Real server.py, stub model streaming 10 chunks 0.15 s apart (~1.5 s
+        # per answer). Three different prompts at once: each finishes in about
+        # one generation time, not three back to back.
+        chunks = [f"w{i} " for i in range(10)]
+        with _ServerProcess(chunks, "--max-gen", "3", delay=0.15) as proc:
+            results = {}
+            def ask(name):
+                start = time.monotonic()
+                _, _, answers, _, _ = parse_message(proc.query(build_query(name), timeout=10))
+                results[name] = (time.monotonic() - start, _decode_txt(answers[0]["rdata"]))
+            threads = [threading.Thread(target=ask, args=(f"p{i}x.e.com",)) for i in range(3)]
+            [t.start() for t in threads]
+            [t.join() for t in threads]
+        for name, (seconds, text) in results.items():
+            self.assertEqual(text, "".join(chunks) + " [done]", name)
+            self.assertLess(seconds, 3.0, name)  # serial would be ~1.6 / 3.2 / 4.8 s
 
 
 class TestDigE2E(unittest.TestCase):

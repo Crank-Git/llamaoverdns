@@ -612,30 +612,66 @@ class Server:
         return self._txt_response(q, header["id"], opt_bytes, reply)
 
 
-def run_udp_server(server, host, port):
-    """Serve DNS over UDP. Malformed packets are logged and dropped."""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind((host, port))
-    # Flushed so the line shows up immediately when stdout is a pipe or a log.
-    print(f"ollama-over-dns listening on udp {host}:{port} (zone {server.zone})", flush=True)
-    while True:
-        data, addr = sock.recvfrom(2048)
+# At most this many packets are handled at once. Each handler can block for up
+# to --wait seconds, so this bounds the threads a flood of queries can create;
+# packets beyond it are dropped (the client retries).
+MAX_INFLIGHT = 64
+
+
+def serve(sock, server, *, max_inflight=MAX_INFLIGHT, stop=None):
+    """Answer DNS packets arriving on ``sock`` until ``stop`` is set.
+
+    Each packet is handled on its own thread, so a query waiting on a slow
+    generation never delays any other query. Malformed packets are logged and
+    dropped.
+    """
+    slots = threading.BoundedSemaphore(max_inflight)
+    stop = stop or threading.Event()
+    sock.settimeout(0.2)  # wake up regularly to check ``stop``
+    while not stop.is_set():
+        try:
+            data, addr = sock.recvfrom(2048)
+        except socket.timeout:
+            continue
+        except OSError:
+            return  # socket closed under us
+        if not slots.acquire(blocking=False):
+            print(f"dropping packet from {addr}: {max_inflight} queries in flight",
+                  file=sys.stderr)
+            continue
+        threading.Thread(target=_handle_packet, args=(sock, server, data, addr, slots),
+                         daemon=True).start()
+
+
+def _handle_packet(sock, server, data, addr, slots):
+    try:
         try:
             header, questions, _answers, _additional, opt = parse_message(data)
         except DNSError as e:
             print(f"dropping malformed packet from {addr}: {e}", file=sys.stderr)
-            continue
+            return
         try:
             response = server.handle(header, questions, opt)
         except Exception as e:
             print(f"error handling {addr}: {e!r}", file=sys.stderr)
-            continue
+            return
         if response is None:
-            continue
+            return
         try:
             sock.sendto(response, addr)
-        except Exception as e:
+        except OSError as e:
             print(f"error replying to {addr}: {e!r}", file=sys.stderr)
+    finally:
+        slots.release()
+
+
+def run_udp_server(server, host, port):
+    """Bind a UDP socket and serve DNS on it forever."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind((host, port))
+    # Flushed so the line shows up immediately when stdout is a pipe or a log.
+    print(f"ollama-over-dns listening on udp {host}:{port} (zone {server.zone})", flush=True)
+    serve(sock, server)
 
 
 def opt_to_bytes(opt):
