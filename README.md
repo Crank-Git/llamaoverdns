@@ -7,6 +7,7 @@
 <p align="center">
   <a href="https://github.com/Crank-Git/llamaoverdns/actions/workflows/test.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/Crank-Git/llamaoverdns/test.yml?branch=main&style=flat-square&label=ci&labelColor=30363d"></a>
   <a href="https://github.com/Crank-Git/llamaoverdns/releases"><img alt="Latest release" src="https://img.shields.io/github/v/release/Crank-Git/llamaoverdns?style=flat-square&labelColor=30363d&color=7ee787"></a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-7ee787?style=flat-square&labelColor=30363d"></a>
 </p>
 
 <p align="center">
@@ -143,6 +144,10 @@ processes and the real client over UDP against stub backends, so no model is nee
 The server has no rate limiting and no authentication. It binds `127.0.0.1` by default;
 `--host 0.0.0.0` hands your model to every host that can reach this one, so do that only on
 purpose.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
 
 ---
 
