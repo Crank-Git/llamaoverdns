@@ -85,7 +85,7 @@ Run the server against a real backend and page through an answer with the
 client and with `dig`:
 
 ```console
-# ollama (another machine works too: OLLAMA_HOST=192.168.1.215)
+# ollama (another machine works too: OLLAMA_HOST=192.0.2.10)
 $ python3 server.py --backend ollama --model qwen2.5:3b --page-bytes 200
 
 # or llama-server; --reasoning-format none leaves <think> in the content,
